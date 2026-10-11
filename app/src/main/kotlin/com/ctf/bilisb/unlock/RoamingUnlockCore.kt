@@ -165,6 +165,14 @@ object RoamingUnlockCore {
      * 任何一步失败抛异常，由适配器退化为放行原响应（宁可不解锁，不黑屏）。
      * 返回字节而非宿主对象：K/gRPC 侧拿到字节就能继续走它自己的序列化链。
      */
+    private val defaultTemplateBytes: ByteArray? by lazy {
+        runCatching {
+            RoamingUnlockCore::class.java.classLoader
+                ?.getResourceAsStream("unlock/play_view_reply_template.bin")
+                ?.readBytes()
+        }.getOrNull()
+    }
+
     fun rebuildReplyBytes(
         cl: ClassLoader,
         hostReplyBytes: ByteArray?,
@@ -172,7 +180,8 @@ object RoamingUnlockCore {
         reqCid: Long,
         reqAid: Long,
     ): ByteArray {
-        val hostReply = hostReplyBytes?.let { bytes ->
+        val effectiveBytes = hostReplyBytes ?: defaultTemplateBytes
+        val hostReply = effectiveBytes?.let { bytes ->
             cl.loadClass(HostTargets.PLAY_VIEW_UNITE_REPLY_CLASS)
                 .getMethod("parseFrom", ByteArray::class.java)
                 .invoke(null, bytes)
@@ -181,3 +190,4 @@ object RoamingUnlockCore {
         return reply.javaClass.getMethod("toByteArray").invoke(reply) as ByteArray
     }
 }
+

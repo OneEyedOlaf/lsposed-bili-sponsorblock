@@ -92,6 +92,22 @@ object ResponseReconstructor {
         )
         invoke(builder, "setSupplement", supplement)
 
+        // playArc: 确保存在合法的 cid 与播放时长（无原响应或指定了 reqCid 时更新）
+        val hasPlayArc = runCatching {
+            builder.javaClass.getMethod("hasPlayArc").invoke(builder) as? Boolean ?: false
+        }.getOrDefault(false)
+        if (!hasPlayArc || reqCid > 0) {
+            val effectiveCid = if (reqCid > 0) reqCid else (data.audios.firstOrNull()?.id?.toLong() ?: 1L)
+            val playArcBytes = UnlockWire.buildPlayArcBytes(
+                aid = if (reqAid > 0) reqAid else effectiveCid,
+                cid = effectiveCid,
+                durationMs = data.timelength,
+            )
+            val playArc = parseHost(cl, HostTargets.PLAY_ARC_CLASS, playArcBytes)
+            invoke(builder, "setPlayArc", playArc)
+        }
+
+
         // 顶层 view_info 清理（BiliRoaming G0.p 同语义：清弹窗载荷、留容器与其余字段）。
         // intl 6.6.0 的 playershared.ViewInfo 与 BiliRoaming 面向的国服 schema 不同——
         // 没有 endPage/popWin/toast 单数字段，区域限制弹窗经实拍藏在 dialogMap

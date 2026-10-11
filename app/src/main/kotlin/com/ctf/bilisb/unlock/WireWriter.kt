@@ -92,6 +92,27 @@ object UnlockWire {
     }
 
     /**
+     * 播放弧参数（PlayArc：video_type=1, aid=2, cid=3, dimension=7, duration=8, duration_ms=10, watch_time_length=11）。
+     */
+    fun buildPlayArcBytes(aid: Long, cid: Long, durationMs: Long): ByteArray {
+        val w = WireWriter()
+        w.int32Field(1, 2) // OGV / Bangumi
+        w.int64Field(2, if (aid > 0) aid else 1L)
+        w.int64Field(3, if (cid > 0) cid else 1L)
+        val dim = WireWriter()
+        dim.int32Field(1, 1920)
+        dim.int32Field(2, 1080)
+        w.messageField(7, dim.toByteArray())
+        if (durationMs > 0) {
+            w.int64Field(8, durationMs / 1000)
+            w.int64Field(10, durationMs)
+            w.int64Field(11, durationMs)
+        }
+        return w.toByteArray()
+    }
+
+
+    /**
      * 清晰度选择面板（VodInfo.qn_panel=12 → QnPanel{qn_items=1, repeated StreamInfo}）。
      *
      * 字段号来源：宿主 classes9.dex `playershared.StreamInfo` 的 static_values 常量
@@ -172,6 +193,9 @@ object UnlockWire {
         w.int64Field(1, ep.epId)
         w.stringField(2, ep.badge)
         w.int32Field(3, ep.badgeType)
+        if (ep.badge.isNotEmpty()) {
+            w.messageField(4, buildEpisodeBadgeInfoBytes(ep.badge))
+        }
         w.int64Field(5, ep.duration)
         w.int32Field(6, ep.status)
         w.stringField(7, ep.cover)
@@ -192,6 +216,22 @@ object UnlockWire {
         return w.toByteArray()
     }
 
+    /**
+     * viewunite.common.BadgeInfo：
+     * text=1, text_color=2, text_color_night=3, bg_color=4, bg_color_night=5, bg_style=8。
+     * 宿主 6.6.0 选集卡片右上角角标（VIP 等）优先读取 badge_info(4) 渲染。
+     */
+    private fun buildEpisodeBadgeInfoBytes(badge: String): ByteArray {
+        val w = WireWriter()
+        w.stringField(1, badge)
+        w.stringField(2, "#FFFFFF")
+        w.stringField(3, "#E5E5E5")
+        w.stringField(4, "#FB7299")
+        w.stringField(5, "#BB5B76")
+        w.int32Field(8, 1)
+        return w.toByteArray()
+    }
+
     /** viewunite.common.Rights：allow_download=1, allow_review=2, can_watch=3, allow_dm=5。 */
     private fun seasonEpisodeRightsBytes(): ByteArray {
         val w = WireWriter()
@@ -205,7 +245,7 @@ object UnlockWire {
 
     /**
      * viewunite.common.ViewEpisode 卡片（选集面板 tab 注入用；字段号 2026-10-04 jadx
-     * 实证，与选集面板 ViewEpisode 同源——ep_id=1/badge=2/badge_type=3/duration=5/
+     * 实证，与选集面板 ViewEpisode 同源——ep_id=1/badge=2/badge_type=3/badge_info=4/duration=5/
      * status=6/cover=7/aid=8/title=9/long_title=12/cid=14/ep_index=31/section_index=32/
      * show_title=44）。status 照实拍正季卡取 2。
      */
@@ -214,6 +254,9 @@ object UnlockWire {
         w.int64Field(1, ep.epId)
         w.stringField(2, ep.badge)
         w.int32Field(3, ep.badgeType)
+        if (ep.badge.isNotEmpty()) {
+            w.messageField(4, buildEpisodeBadgeInfoBytes(ep.badge))
+        }
         w.int64Field(5, ep.duration)
         w.int32Field(6, ep.status)
         w.stringField(7, ep.cover)

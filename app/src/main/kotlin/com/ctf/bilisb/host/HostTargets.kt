@@ -380,4 +380,10 @@ object HostTargets {
      */
     const val GRIPPER_ACCOUNT_CLASS = "com.bilibili.gripper.container.account.d"
     const val GRIPPER_GET_ACCESS_KEY = "getAccessKey"
+
+    /** 番剧简介浮层（点击「详情 >」底部弹窗）：跨版本未混淆协程状态机锚点与模型包名（6.5.0 / 6.6.0 双版本实证）。 */
+    const val OGV_INTRO_DETAIL_BIND_CONT_CLASS =
+        "com.bilibili.ship.theseus.ogv.intro.floatlayer.OgvIntroDetailInfoComponent\$bind\$1"
+    const val OGV_INTRO_FLOATLAYER_PKG = "com.bilibili.ship.theseus.ogv.intro.floatlayer"
+    const val OKRETRO_SUCCESS_RESPONSE_CLASS = "com.bilibili.okretro.response.b\$c"
 }

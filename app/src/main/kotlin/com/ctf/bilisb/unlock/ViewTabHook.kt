@@ -53,6 +53,171 @@ object ViewTabHook {
     /** season_id → 剧集（进程内缓存，避免每次进详情页都打服务端）。只存成功结果。 */
     private val episodesBySeasonId = ConcurrentHashMap<Int, List<SeasonEpisode>>()
 
+    /** season_id → Bstar 完整季详情（包含封面、简介等）。 */
+    private val seasonDetailBySeasonId = ConcurrentHashMap<Int, ThSeasonDetail>()
+
+    /** season_id → 并发请求锁（防止 ViewUniteMoss 与 PlayViewHook 同时触发重复拉取）。 */
+    private val seasonLocks = ConcurrentHashMap<Int, Any>()
+
+    private fun lockForSeason(seasonId: Int): Any =
+        seasonLocks.computeIfAbsent(seasonId) { Any() }
+
+    /**
+     * 按 sid 查询首集 ep_id。
+     */
+    fun epIdForSeason(seasonId: Int): Long? {
+        if (seasonId <= 0) return null
+        return episodesBySeasonId[seasonId]?.firstOrNull()?.epId
+    }
+
+    /**
+     * 获取或网络拉取剧集列表（优先查缓存，次查 Bstar，最后回退 CN/TW 季接口）。
+     */
+    fun getOrFetchEpisodes(module: XposedModule, seasonId: Int): List<SeasonEpisode> {
+        if (seasonId <= 0) return emptyList()
+        episodesBySeasonId[seasonId]?.let { return it }
+        val config = UnlockConfig.load(module)
+        if (!config.enabled || config.servers.isEmpty()) return emptyList()
+        val server = config.servers.firstOrNull { it.area == "th" } ?: config.servers.first()
+        val serverBase = server.baseUrl.trimEnd('/')
+        val accessKey = server.accessKey.ifBlank { HostAccessKey.lastSeen() } ?: ""
+        return synchronized(lockForSeason(seasonId)) {
+            episodesBySeasonId[seasonId]?.let { return@synchronized it }
+            val detail = seasonDetailBySeasonId[seasonId]
+                ?: fetchThSeasonDetail(module, seasonId, serverBase, accessKey)
+            if (detail != null && detail.episodes.isNotEmpty()) {
+                episodesBySeasonId[seasonId] = detail.episodes
+                seasonDetailBySeasonId[seasonId] = detail
+                return@synchronized detail.episodes
+            }
+            fetchEpisodes(module, seasonId, serverBase, accessKey)
+        }
+    }
+
+    /**
+     * 从 ViewReq 或 PlayViewUniteReq 提取 season_id。
+     */
+    fun extractSeasonId(req: Any?): Int {
+        if (req == null) return 0
+        return runCatching {
+            val extra = req.javaClass.methods.firstOrNull { it.name == "getExtraContentMap" }?.invoke(req)
+            @Suppress("UNCHECKED_CAST")
+            val map = extra as? Map<String, String>
+            map?.get("season_id")?.toIntOrNull()
+                ?: map?.get("seasonId")?.toIntOrNull()
+                ?: 0
+        }.getOrDefault(0)
+    }
+
+    /**
+     * 从 ViewReq 提取 ep_id。
+     */
+    fun extractEpId(req: Any?): Long {
+        if (req == null) return 0L
+        return runCatching {
+            val extra = req.javaClass.methods.firstOrNull { it.name == "getExtraContentMap" }?.invoke(req)
+            @Suppress("UNCHECKED_CAST")
+            val map = extra as? Map<String, String>
+            map?.get("ep_id")?.toLongOrNull()
+                ?: map?.get("epId")?.toLongOrNull()
+                ?: 0L
+        }.getOrDefault(0L)
+    }
+
+    /**
+     * 拉取 Bstar 季详情（投递到后台线程池，避免在主线程触发 NetworkOnMainThreadException）。
+     */
+    fun fetchThSeasonDetail(
+        module: XposedModule,
+        seasonId: Int,
+        serverBase: String,
+        accessKey: String,
+    ): ThSeasonDetail? {
+        val akParam = if (accessKey.isNotEmpty()) "&access_key=$accessKey" else ""
+        val url = "$serverBase/intl/gateway/v2/ogv/view/app/season?season_id=$seasonId" +
+            akParam +
+            "&s_locale=zh_SG&c_locale=zh_SG&mobi_app=bstar_a&platform=android"
+        val content = runCatching {
+            BoundedCall.await(executor, SEASON_FETCH_TIMEOUT_MS + 1000L) {
+                PlayViewHook.defaultFetch(url, "bstar_a", timeoutMs = SEASON_FETCH_TIMEOUT_MS)
+            }
+        }.onFailure { t ->
+            HookProbe.first(module, "viewTab:thSeasonErr", 3) {
+                "sid=$seasonId ${t.javaClass.simpleName}: ${t.message}"
+            }
+        }.getOrNull() ?: return null
+        return SeasonParser.parseThSeasonDetail(content)
+    }
+
+    /**
+     * 当主站 View 调用抛异常或返回 -404 时尝试救援：
+     * 从请求提取 seasonId，通过 Bstar 拉取季详情，经 [ThViewReplyReconstructor] 重构出合法的 ViewReply 响应。
+     */
+    fun tryRescueError(module: XposedModule, cl: ClassLoader, req: Any?, error: Throwable?): Any? {
+        var seasonId = extractSeasonId(req)
+        if (seasonId <= 0) {
+            val epId = extractEpId(req)
+            if (epId > 0) {
+                seasonId = episodesBySeasonId.entries.firstOrNull { entry -> entry.value.any { it.epId == epId } }?.key ?: 0
+            }
+        }
+        if (seasonId <= 0) return null
+        val config = UnlockConfig.load(module)
+        if (!config.enabled || config.servers.isEmpty()) return null
+
+        HookProbe.first(module, "viewTab:rescueError", 3) {
+            "sid=$seasonId 触发 View 404 救援: ${error?.javaClass?.simpleName}: ${error?.message}"
+        }
+
+        val server = config.servers.firstOrNull { it.area == "th" } ?: config.servers.first()
+        val serverBase = server.baseUrl.trimEnd('/')
+        val accessKey = server.accessKey.ifBlank { HostAccessKey.lastSeen() } ?: ""
+
+        val detail = synchronized(lockForSeason(seasonId)) {
+            var d = seasonDetailBySeasonId[seasonId]
+                ?: fetchThSeasonDetail(module, seasonId, serverBase, accessKey)
+            if (d != null && d.episodes.isNotEmpty()) {
+                seasonDetailBySeasonId[seasonId] = d
+                episodesBySeasonId[seasonId] = d.episodes
+            } else {
+                val eps = episodesBySeasonId[seasonId]
+                    ?: fetchEpisodes(module, seasonId, serverBase, accessKey)
+                if (eps.isNotEmpty()) {
+                    d = ThSeasonDetail(
+                        seasonId = seasonId,
+                        title = eps.first().title,
+                        cover = eps.first().cover,
+                        evaluate = "",
+                        total = eps.size,
+                        episodes = eps,
+                    )
+                }
+            }
+            d
+        }
+        if (detail == null || detail.episodes.isEmpty()) {
+            HookProbe.first(module, "viewTab:rescueFailed", 3) { "sid=$seasonId 季数据拉取为空" }
+            return null
+        }
+
+        val rawRebuiltBytes = ThViewReplyReconstructor.reconstruct(detail)
+        val finalBytes = if (config.cacheUnlock) DownloadRightsPatch.patch(rawRebuiltBytes) else rawRebuiltBytes
+        return runCatching {
+            val rebuilt = cl.loadClass(HostTargets.VIEW_UNITE_REPLY_CLASS)
+                .getMethod("parseFrom", ByteArray::class.java)
+                .invoke(null, finalBytes)
+            HookProbe.first(module, "viewTab:rescued", 3) {
+                "sid=$seasonId title=${detail.title} eps=${detail.episodes.size} (${finalBytes.size}B)"
+            }
+            rebuilt
+        }.onFailure { t ->
+            HookProbe.first(module, "viewTab:rescueParseFailed", 3) {
+                "${t.javaClass.simpleName}: ${t.message}"
+            }
+        }.getOrNull()
+    }
+
+
     /**
      * 按 cid 反查 ep_id。
      *
@@ -71,7 +236,7 @@ object ViewTabHook {
     private val seasonFailAt = ConcurrentHashMap<Int, Long>()
 
     private val executor by lazy {
-        Executors.newSingleThreadExecutor { r ->
+        Executors.newCachedThreadPool { r ->
             Thread(r, "BiliSB-ViewTabNet").apply { isDaemon = true }
         }
     }
@@ -84,6 +249,193 @@ object ViewTabHook {
 
     fun install(module: XposedModule, cl: ClassLoader) {
         tryInstall(module, cl)
+        installIntroDetailHook(module, cl)
+    }
+
+    private class IntroDetailApiHandler(
+        private val module: XposedModule,
+        private val cl: ClassLoader,
+        private val origApi: Any,
+    ) : java.lang.reflect.InvocationHandler {
+        override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?): Any? {
+            if (method.declaringClass == Any::class.java) {
+                return when (method.name) {
+                    "toString" -> origApi.toString()
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === args?.firstOrNull()
+                    else -> method.invoke(origApi, *(args ?: emptyArray()))
+                }
+            }
+            if (!args.isNullOrEmpty() && args[0] is Number) {
+                val mediaId = (args[0] as Number).toLong()
+                val detail = seasonDetailBySeasonId[mediaId.toInt()]
+                if (detail != null) {
+                    val mocked = runCatching {
+                        val vo = buildOgvIntroInfoVo(cl, detail)
+                        val respClass = Class.forName(HostTargets.OKRETRO_SUCCESS_RESPONSE_CLASS, false, cl)
+                        respClass.getConstructor(Any::class.java).newInstance(vo)
+                    }.onFailure { t ->
+                        HookProbe.first(module, "viewTab:introBuildErr", 3) {
+                            "mediaId=$mediaId ${t.javaClass.simpleName}: ${t.message}"
+                        }
+                    }.getOrNull()
+                    if (mocked != null) {
+                        HookProbe.first(module, "viewTab:introInjected", 5) {
+                            "mediaId=$mediaId title=${detail.title}"
+                        }
+                        return mocked
+                    }
+                }
+            }
+            return try {
+                method.invoke(origApi, *(args ?: emptyArray()))
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                throw e.targetException ?: e
+            }
+        }
+    }
+
+    /**
+     * 拦截播放页点击「详情 >」弹出的底部简介浮层（OgvIntroDetailInfoComponent）：
+     * 当 mediaId 命中已缓存的 Bstar 东南亚番剧（[seasonDetailBySeasonId]）时，
+     * 直接由 [ThSeasonDetail] 构造 `OgvIntroInfoVo` 并包装为 `com.bilibili.okretro.response.b$c` 返回，
+     * 避免宿主向主站请求不存在的东南亚 media_id 导致详情浮层空白。
+     */
+    private fun installIntroDetailHook(module: XposedModule, cl: ClassLoader) {
+        runCatching {
+            val bindContClass = Class.forName(HostTargets.OGV_INTRO_DETAIL_BIND_CONT_CLASS, false, cl)
+            val componentClass = bindContClass.getDeclaredField("this\$0").type
+            val ctor = componentClass.declaredConstructors.firstOrNull()
+                ?: run {
+                    HookProbe.miss(module, "viewTab:introDetail", "no constructor on ${componentClass.name}")
+                    return
+                }
+            val apiField = componentClass.declaredFields.firstOrNull { f ->
+                f.type.isInterface && f.type.name.startsWith(HostTargets.OGV_INTRO_FLOATLAYER_PKG)
+            } ?: componentClass.getDeclaredField("h")
+            runCatching { ctor.isAccessible = true }
+            runCatching { apiField.isAccessible = true }
+            module.hook(ctor)
+                .setPriority(PRIORITY_DEFAULT)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .intercept { chain ->
+                    val res = chain.proceed()
+                    val instance = chain.thisObject
+                    if (instance != null) {
+                        runCatching {
+                            val origApi = apiField.get(instance)
+                            if (origApi != null &&
+                                !(Proxy.isProxyClass(origApi.javaClass) &&
+                                    Proxy.getInvocationHandler(origApi) is IntroDetailApiHandler)
+                            ) {
+                                val proxy = Proxy.newProxyInstance(
+                                    cl,
+                                    arrayOf(apiField.type),
+                                    IntroDetailApiHandler(module, cl, origApi),
+                                )
+                                apiField.set(instance, proxy)
+                            }
+                        }.onFailure { t ->
+                            HookProbe.first(module, "viewTab:introProxyErr", 3) {
+                                "${t.javaClass.simpleName}: ${t.message}"
+                            }
+                        }
+                    }
+                    res
+                }
+            HookProbe.ok(module, "viewTab:introDetail", "${componentClass.simpleName}.${apiField.name}")
+        }.onFailure { t ->
+            HookProbe.miss(module, "viewTab:introDetail", "${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    internal fun buildOgvIntroInfoVo(cl: ClassLoader, detail: ThSeasonDetail): Any {
+        val pkg = HostTargets.OGV_INTRO_FLOATLAYER_PKG
+        val areaClass = Class.forName("$pkg.Area", false, cl)
+        val areaCtor = areaClass.getConstructor(Long::class.javaPrimitiveType, String::class.java)
+        val areas = detail.areas.split(" ").filter { it.isNotBlank() }.mapIndexed { idx, name ->
+            areaCtor.newInstance((idx + 1).toLong(), name)
+        }
+
+        val publishClass = Class.forName("$pkg.Publish", false, cl)
+        val publishCtor = publishClass.getConstructor(
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            Boolean::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType,
+        )
+        val timeLengthShow = detail.timeLengthShow.ifEmpty {
+            if (detail.total > 0) "全${detail.total}话" else ""
+        }
+        val isFinish = timeLengthShow.contains("完结") || timeLengthShow.startsWith("全")
+        val publish = publishCtor.newInstance(
+            0,
+            0,
+            "",
+            "",
+            detail.publishDateShow,
+            timeLengthShow,
+            true,
+            isFinish,
+        )
+
+        val styleClass = Class.forName("$pkg.Style", false, cl)
+        val styleCtor = styleClass.getConstructor(
+            Long::class.javaPrimitiveType,
+            String::class.java,
+            String::class.java,
+        )
+        val styles = detail.styles.split(" ").filter { it.isNotBlank() }.mapIndexed { idx, name ->
+            styleCtor.newInstance((idx + 1).toLong(), "", name)
+        }
+
+        val actor = if (detail.actorInfo.isNotBlank()) {
+            val actorClass = Class.forName("$pkg.Actor", false, cl)
+            actorClass.getConstructor(String::class.java, String::class.java)
+                .newInstance(detail.actorTitle.ifEmpty { "角色声优" }, detail.actorInfo)
+        } else {
+            null
+        }
+
+        val staff = if (detail.staffInfo.isNotBlank()) {
+            val staffClass = Class.forName("$pkg.Staff", false, cl)
+            staffClass.getConstructor(String::class.java, String::class.java)
+                .newInstance(detail.staffTitle.ifEmpty { "制作信息" }, detail.staffInfo)
+        } else {
+            null
+        }
+
+        val ratingClass = Class.forName("$pkg.Rating", false, cl)
+        val rating = ratingClass.getConstructor(Float::class.javaPrimitiveType, String::class.java)
+            .newInstance(0f, "")
+
+        val voClass = Class.forName("$pkg.OgvIntroInfoVo", false, cl)
+        val voCtor = voClass.constructors.first { it.parameterTypes.size == 18 }
+        val sidLong = detail.seasonId.toLong()
+        return voCtor.newInstance(
+            sidLong,                           // 1. seasonId: Long
+            1,                                 // 2. mediaType: Int
+            sidLong,                           // 3. mediaId: Long
+            detail.cover,                      // 4. cover: String
+            detail.title,                      // 5. mediaTitle: String
+            "",                                // 6. seasonTitle: String
+            detail.typeName.ifEmpty { "番剧" }, // 7. typeName: String
+            areas,                             // 8. areas: List<Area>
+            publish,                           // 9. publish: Publish
+            null,                              // 10. mediaBadgeInfo: OgvBadgeInfo?
+            detail.alias,                      // 11. alias: String
+            detail.originName,                 // 12. originName: String
+            styles,                            // 13. styles: List<Style>
+            emptyList<Any>(),                  // 14. celebrities: List<Celebrity>
+            actor,                             // 15. actor: Actor?
+            staff,                             // 16. staff: Staff?
+            detail.evaluate,                   // 17. evaluate: String
+            rating,                            // 18. rating: Rating
+        )
     }
 
     private fun tryInstall(module: XposedModule, cl: ClassLoader) {
@@ -136,14 +488,32 @@ object ViewTabHook {
                             if (args != null && args.isNotEmpty() && isCarrier(method.name)) {
                                 args[0] = transform(module, cl, req, args[0])
                             }
+                            if (method.name == "onError" && args != null && args.isNotEmpty()) {
+                                val rescued = tryRescueError(module, cl, req, args[0] as? Throwable)
+                                if (rescued != null) {
+                                    val onNextMethod = handler.javaClass.methods.firstOrNull { it.name == "onNext" }
+                                    val onCompletedMethod = handler.javaClass.methods.firstOrNull { it.name == "onCompleted" }
+                                    onNextMethod?.invoke(handler, rescued)
+                                    onCompletedMethod?.invoke(handler)
+                                    return@newProxyInstance null
+                                }
+                            }
                             method.invoke(handler, *(args ?: emptyArray()))
                         },
                     )
                     return@intercept chain.proceed(arrayOf(req, wrapped))
                 }
-                transform(module, cl, req, chain.proceed())
+                try {
+                    val reply = chain.proceed()
+                    val transformed = transform(module, cl, req, reply)
+                    transformed ?: tryRescueError(module, cl, req, null)
+                } catch (t: Throwable) {
+                    val rescued = tryRescueError(module, cl, req, t)
+                    rescued ?: throw t
+                }
             }
     }
+
 
     private fun isCarrier(name: String): Boolean =
         name == "onNext" || name == "onCompleted" || name == "resumeWith" || name == "onSuccess"
@@ -313,7 +683,7 @@ object ViewTabHook {
      * Module{type=1:13, section_data(12)}：SectionData{id=1, section_id=2, title=3,
      * module_style(9)={1:1}, episodes(7)}——层级与取值照迷宫饭 ss47083 实拍模板。
      */
-    private fun buildSectionModuleBytes(seasonId: Int, episodes: List<SeasonEpisode>): ByteArray {
+    internal fun buildSectionModuleBytes(seasonId: Int, episodes: List<SeasonEpisode>): ByteArray {
         val sd = WireWriter()
         sd.int32Field(1, seasonId)
         sd.int32Field(2, seasonId)

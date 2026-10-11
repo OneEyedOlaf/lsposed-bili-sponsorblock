@@ -219,6 +219,16 @@ object PlayViewHook {
                             if (args != null && args.isNotEmpty() && isResponseCarrier(method.name)) {
                                 args[0] = transformer.apply(method.name, args[0])
                             }
+                            if (method.name == "onError" && args != null && args.isNotEmpty()) {
+                                val rescued = transformer.rescueError(args[0] as? Throwable)
+                                if (rescued != null) {
+                                    val onNextMethod = handler.javaClass.methods.firstOrNull { it.name == "onNext" }
+                                    val onCompletedMethod = handler.javaClass.methods.firstOrNull { it.name == "onCompleted" }
+                                    onNextMethod?.invoke(handler, rescued)
+                                    onCompletedMethod?.invoke(handler)
+                                    return@newProxyInstance null
+                                }
+                            }
                             method.invoke(handler, *(args ?: emptyArray()))
                         },
                     )
@@ -238,11 +248,13 @@ object PlayViewHook {
                         "download=${reqFacts.isDownload} ep=${reqFacts.epId} " +
                             "${failure.javaClass.simpleName}: ${failure.message}"
                     }
-                    // 宿主取地址直接抛异常（下载引擎路径）——先按「无原始响应」漫游重建：
-                    // 重建成功即替代该异常，下载才可能继续；否则维持宿主原语义抛回，不改变非解锁场景。
-                    val rebuilt = transformer.rebuildAfterHostFailure()
+                    val rebuilt = transformer.rescueError(failure)
                     if (rebuilt != null) return@intercept rebuilt
                     throw failure
+                }
+                if (syncReply == null) {
+                    val rebuilt = transformer.rescueError(null)
+                    if (rebuilt != null) return@intercept rebuilt
                 }
                 HookProbe.first(module, "unlock:syncReturn", 5) {
                     "download=${reqFacts.isDownload} ep=${reqFacts.epId} " +
@@ -488,7 +500,10 @@ object PlayViewHook {
                     val result = RoamingUnlockCore.roam(config, facts, module)
                     if (!result.isSuccess) {
                         // 失败原因文案留在适配器：它同时决定 Toast 文案
-                        failReason = "解析服务器不可用"
+                        val authDenied = result.errors.values.any {
+                            it.contains("10015002") || it.contains("权限不足") || it.contains("大会员")
+                        }
+                        failReason = if (authDenied) "该分集需大会员权限" else "解析服务器不可用"
                         return@Callable null
                     }
                     val data = RoamingUnlockCore.parsePlayurl(config, result.content!!, module)
@@ -558,33 +573,41 @@ object PlayViewHook {
         }
 
         /**
-         * 宿主取地址**直接抛异常**时的兜底（下载引擎路径）。
-         * 适用时返回漫游重建的响应（宿主异常被替代，下载得以继续）；不适用返回 null，
-         * 由调用方把原异常抛回，保持宿主原本行为。
+         * 宿主取播放地址失败（无论是 gRPC 异步返回 onError，还是同步抛出异常/返回 null）时的错误救援。
+         *
+         * 覆盖场景：
+         * 1. 东南亚等受限内容点击卡片进入详情页时，主站 PlayViewUnite 因无版权直接返回 -404 (啥都木有)；
+         * 2. 下载引擎取地址直接抛出 BusinessException。
          */
-        fun rebuildAfterHostFailure(): Any? {
-            if (!reqFacts.isDownload) {
-                HookProbe.first(module, "unlock:hostFailSkipped", 3) { "非下载请求，保留宿主异常" }
+        fun rescueError(error: Throwable?): Any? {
+            if (!config.enabled || config.servers.isEmpty()) return null
+            var epId = reqFacts.epId.toLongOrNull()?.takeIf { it != 0L }
+            val seasonId = reqFacts.seasonId.toIntOrNull()?.takeIf { it != 0 } ?: 0
+            if (epId == null && seasonId != 0) {
+                epId = ViewTabHook.epIdForSeason(seasonId)
+                    ?: ViewTabHook.getOrFetchEpisodes(module, seasonId).firstOrNull()?.epId
+            }
+            if (epId == null && reqFacts.vodCid != 0L) {
+                epId = ViewTabHook.epIdForCid(reqFacts.vodCid)
+            }
+            if (epId == null) {
+                HookProbe.first(module, "unlock:rescueNoEp", 3) {
+                    "sid=$seasonId cid=${reqFacts.vodCid} 无可用 epId，无法救援: ${error?.javaClass?.simpleName}: ${error?.message}"
+                }
                 return null
             }
-            if (!config.enabled || config.servers.isEmpty()) {
-                HookProbe.first(module, "unlock:hostFailOff", 3) { "宿主取地址失败且解锁未启用/未配服务器" }
-                return null
+            HookProbe.first(module, "unlock:rescueError", 3) {
+                "sid=$seasonId ep=$epId cid=${reqFacts.vodCid} 救援 404: ${error?.javaClass?.simpleName}: ${error?.message}"
             }
-            // 下载请求只带 cid（season/ep 都是 0），而 PGC 播放接口只认 ep_id ——
-            // 用本季剧集缓存（ViewTabHook 的 episodesBySeasonId）按 cid 反查补上。
-            val epId = reqFacts.epId.toLongOrNull()?.takeIf { it != 0L }
-                ?: ViewTabHook.epIdForCid(reqFacts.vodCid)
-            if (epId == null && reqFacts.vodCid == 0L) {
-                HookProbe.first(module, "unlock:hostFailNoId", 3) { "既无 cid 也无 ep，无法漫游" }
-                return null
-            }
-            HookProbe.first(module, "unlock:hostFailEp", 3) {
-                "cid=${reqFacts.vodCid} ep=${epId ?: 0L} resolved=${epId != null}"
-            }
-            return roamAndRebuild(null, reqFacts.vodCid, epId ?: 0L)
+            return roamAndRebuild(null, reqFacts.vodCid, epId)
         }
+
+        /**
+         * 兼容保留旧调用点。
+         */
+        fun rebuildAfterHostFailure(): Any? = rescueError(null)
     }
+
 
     private val mainHandler by lazy { Handler(android.os.Looper.getMainLooper()) }
 

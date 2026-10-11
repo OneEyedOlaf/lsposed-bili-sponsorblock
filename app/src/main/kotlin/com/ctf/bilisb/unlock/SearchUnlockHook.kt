@@ -499,8 +499,10 @@ object SearchUnlockHook {
                 val ew = WireWriter()
                 val epTitle = ep.optString("index").ifEmpty { ep.optString("title", (i + 1).toString()) }
                 ew.stringField(1, epTitle)
+                val seasonId = card.optLong("season_id", 0)
                 val uri = ep.optString("uri").ifEmpty {
-                    "https://www.bilibili.com/bangumi/play/ep$epId"
+                    if (seasonId > 0) "bilibili://bangumi/season/$seasonId?ep_id=$epId"
+                    else "https://www.bilibili.com/bangumi/play/ep$epId"
                 }
                 ew.stringField(2, uri)
                 ew.stringField(3, epId)

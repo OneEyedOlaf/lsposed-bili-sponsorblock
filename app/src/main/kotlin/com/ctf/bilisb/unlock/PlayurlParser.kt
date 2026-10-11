@@ -54,7 +54,91 @@ object PlayurlParser {
             if (result !is String) json = json.getJSONObject("result")
         }
         if (json.optInt("code", 0) != 0) return null
-        val dash = json.optJSONObject("dash") ?: return null
+        val dash = json.optJSONObject("dash")
+        if (dash == null) {
+            val vinfo = json.optJSONObject("data")?.optJSONObject("video_info")
+                ?: json.optJSONObject("video_info")
+            if (vinfo != null) {
+                val streamList = vinfo.optJSONArray("stream_list")
+                val formatMap = LinkedHashMap<Int, JSONObject>()
+                val videos = mutableListOf<DashTrack>()
+                if (streamList != null) {
+                    for (i in 0 until streamList.length()) {
+                        val s = streamList.optJSONObject(i) ?: continue
+                        val dv = s.optJSONObject("dash_video") ?: continue
+                        val baseUrl = dv.optString("base_url")
+                        if (baseUrl.isEmpty()) continue
+                        val sinfo = s.optJSONObject("stream_info") ?: JSONObject()
+                        val qn = sinfo.optInt("quality", 0)
+                        val desc = sinfo.optString("description")
+                        val newDesc = sinfo.optString("new_description", desc)
+                        val bkList = mutableListOf<String>()
+                        val bk = dv.optJSONArray("backup_url")
+                        if (bk != null) {
+                            for (j in 0 until bk.length()) bk.optString(j)?.let { bkList.add(it) }
+                        }
+                        val meta = StreamMeta(
+                            quality = qn,
+                            format = sinfo.optString("format", "flv"),
+                            description = desc,
+                            newDescription = newDesc,
+                        )
+                        videos.add(
+                            DashTrack(
+                                id = qn,
+                                baseUrl = baseUrl,
+                                backupUrls = bkList,
+                                bandwidth = dv.optInt("bandwidth"),
+                                codecid = dv.optInt("codecid", 7),
+                                md5 = dv.optString("md5"),
+                                size = dv.optLong("size"),
+                                meta = meta,
+                            ),
+                        )
+                        formatMap[qn] = sinfo
+                    }
+                }
+                val audios = mutableListOf<DashTrack>()
+                val audioArr = vinfo.optJSONArray("dash_audio")
+                if (audioArr != null) {
+                    for (i in 0 until audioArr.length()) {
+                        val a = audioArr.optJSONObject(i) ?: continue
+                        val baseUrl = a.optString("base_url")
+                        if (baseUrl.isEmpty()) continue
+                        val bkList = mutableListOf<String>()
+                        val bk = a.optJSONArray("backup_url")
+                        if (bk != null) {
+                            for (j in 0 until bk.length()) bk.optString(j)?.let { bkList.add(it) }
+                        }
+                        audios.add(
+                            DashTrack(
+                                id = a.optInt("id", 30280),
+                                baseUrl = baseUrl,
+                                backupUrls = bkList,
+                                bandwidth = a.optInt("bandwidth"),
+                                codecid = a.optInt("codecid", 0),
+                                md5 = a.optString("md5"),
+                                size = a.optLong("size"),
+                            ),
+                        )
+                    }
+                }
+                if (videos.isNotEmpty()) {
+                    val quality = vinfo.optInt("quality", videos.first().id)
+                    val timelength = vinfo.optLong("timelength", 0L)
+                    return@runCatching PlayurlData(
+                        quality = quality,
+                        format = "flv",
+                        timelength = timelength,
+                        videoCodecid = videos.firstOrNull()?.codecid ?: 7,
+                        videos = videos,
+                        audios = audios,
+                        formats = formatMap,
+                    )
+                }
+            }
+            return null
+        }
 
         fun tracks(key: String): List<DashTrack> {
             val arr = dash.optJSONArray(key) ?: return emptyList()
@@ -151,6 +235,28 @@ data class SeasonSection(
     val episodes: List<SeasonEpisode>,
 )
 
+/** 东南亚（Bstar/TH）季详情模型（/intl/gateway/v2/ogv/view/app/season 的解析结果）。 */
+data class ThSeasonDetail(
+    val seasonId: Int,
+    val title: String,
+    val cover: String,
+    val evaluate: String,
+    val total: Int,
+    val episodes: List<SeasonEpisode>,
+    val originName: String = "",
+    val alias: String = "",
+    val styles: String = "",
+    val areas: String = "",
+    val typeName: String = "",
+    val publishDateShow: String = "",
+    val timeLengthShow: String = "",
+    val actorTitle: String = "",
+    val actorInfo: String = "",
+    val staffTitle: String = "",
+    val staffInfo: String = "",
+)
+
+
 /**
  * CN season JSON（api.bilibili.com/pgc/view/web/season 匿名可取，CN 直连）
  * → 选集面板中间模型。字段名与 CN 接口对齐：result.seasons[] 每季含 episodes[]。
@@ -161,12 +267,17 @@ object SeasonParser {
         arr ?: return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val e = arr.optJSONObject(i) ?: return@mapNotNull null
+            val rawBadge = e.optString("badge")
+            val rawBadgeType = e.optInt("badge_type")
+            val status = e.optInt("status")
+            val badge = if (rawBadge.isNotEmpty()) rawBadge else if (status == 13) "VIP" else ""
+            val badgeType = if (rawBadge.isNotEmpty()) rawBadgeType else if (status == 13) 1 else 0
             SeasonEpisode(
                 epId = e.optLong("id"),
-                badge = e.optString("badge"),
-                badgeType = e.optInt("badge_type"),
+                badge = badge,
+                badgeType = badgeType,
                 duration = e.optLong("duration"),
-                status = e.optInt("status"),
+                status = status,
                 cover = e.optString("cover"),
                 aid = e.optLong("aid"),
                 title = e.optString("title"),
@@ -246,9 +357,102 @@ object SeasonParser {
     }
 
     /**
+     * 解析 Bstar modules[].data.episodes。
+     */
+    fun parseEpisodesFromModules(modules: org.json.JSONArray?): List<SeasonEpisode> {
+        modules ?: return emptyList()
+        for (i in 0 until modules.length()) {
+            val m = modules.optJSONObject(i) ?: continue
+            if (m.optString("style") == "positive") {
+                val d = m.optJSONObject("data") ?: continue
+                val eps = parseEpisodes(d.optJSONArray("episodes"))
+                if (eps.isNotEmpty()) return eps
+            }
+        }
+        for (i in 0 until modules.length()) {
+            val m = modules.optJSONObject(i) ?: continue
+            val d = m.optJSONObject("data") ?: continue
+            val eps = parseEpisodes(d.optJSONArray("episodes"))
+            if (eps.isNotEmpty()) return eps
+        }
+        return emptyList()
+    }
+
+    /**
+     * 解析 Bstar 东南亚季详情（/intl/gateway/v2/ogv/view/app/season）。
+     */
+    fun parseThSeasonDetail(content: String): ThSeasonDetail? = runCatching {
+        var json = org.json.JSONObject(content)
+        json.opt("result")?.let { result ->
+            if (result !is String) json = json.getJSONObject("result")
+        }
+        if (json.optInt("code", 0) != 0) return null
+        val sid = json.optInt("season_id")
+        if (sid <= 0) return null
+        val title = json.optString("title")
+        val cover = json.optString("cover").ifEmpty { json.optString("square_cover") }
+        val evaluate = json.optString("evaluate")
+        val total = json.optInt("total")
+        val eps = parseEpisodesFromModules(json.optJSONArray("modules"))
+            .ifEmpty { parseEpisodes(json.optJSONArray("episodes")) }
+            .ifEmpty {
+                json.optJSONArray("seasons")?.optJSONObject(0)
+                    ?.let { parseEpisodes(it.optJSONArray("episodes")) } ?: emptyList()
+            }
+        val originName = json.optString("origin_name")
+        val alias = json.optString("alias")
+        val typeName = json.optString("type_name")
+        val stylesList = mutableListOf<String>()
+        val stylesArr = json.optJSONArray("styles")
+        if (stylesArr != null) {
+            for (i in 0 until stylesArr.length()) {
+                val s = stylesArr.optJSONObject(i)?.optString("name")
+                if (!s.isNullOrEmpty()) stylesList.add(s)
+            }
+        }
+        val areasList = mutableListOf<String>()
+        val areasArr = json.optJSONArray("areas")
+        if (areasArr != null) {
+            for (i in 0 until areasArr.length()) {
+                val a = areasArr.optJSONObject(i)?.optString("name")
+                if (!a.isNullOrEmpty()) areasList.add(a)
+            }
+        }
+        val publishObj = json.optJSONObject("publish")
+        val publishDateShow = publishObj?.optString("release_date_show").orEmpty()
+        val timeLengthShow = publishObj?.optString("time_length_show").orEmpty()
+        val actorObj = json.optJSONObject("actor")
+        val actorTitle = actorObj?.optString("title").orEmpty()
+        val actorInfo = actorObj?.optString("info").orEmpty()
+        val staffObj = json.optJSONObject("staff")
+        val staffTitle = staffObj?.optString("title").orEmpty()
+        val staffInfo = staffObj?.optString("info")
+            ?: json.opt("staff")?.takeIf { it is String }?.toString().orEmpty()
+        ThSeasonDetail(
+            seasonId = sid,
+            title = title,
+            cover = cover,
+            evaluate = evaluate,
+            total = if (total > 0) total else eps.size,
+            episodes = eps,
+            originName = originName,
+            alias = alias,
+            styles = stylesList.joinToString(" "),
+            areas = areasList.joinToString(" "),
+            typeName = typeName,
+            publishDateShow = publishDateShow,
+            timeLengthShow = timeLengthShow,
+            actorTitle = actorTitle,
+            actorInfo = actorInfo,
+            staffTitle = staffTitle,
+            staffInfo = staffInfo,
+        )
+    }.getOrNull()
+
+    /**
      * 解析 `pgc/view/web/season` 顶层 `result.episodes[]`（正季剧集平铺形态；
      * 服务端 `/pgc/view/web/season` 代理路线的返回）。顶层为空时回退首个 season 的
-     * episodes（部分标题的正季挂在 seasons[0] 下）。
+     * episodes（部分标题的正季挂在 seasons[0] 下），再回退 modules[].data.episodes（Bstar 东南亚形态）。
      */
     fun parseFlatEpisodes(content: String): List<SeasonEpisode> = runCatching {
         var json = org.json.JSONObject(content)
@@ -256,9 +460,12 @@ object SeasonParser {
             if (result !is String) json = json.getJSONObject("result")
         }
         if (json.optInt("code", 0) != 0) return emptyList()
-        parseEpisodes(json.optJSONArray("episodes")).ifEmpty {
-            json.optJSONArray("seasons")?.optJSONObject(0)
-                ?.let { parseEpisodes(it.optJSONArray("episodes")) } ?: emptyList()
-        }
+        val eps = parseEpisodes(json.optJSONArray("episodes"))
+        if (eps.isNotEmpty()) return eps
+        val seasonEps = json.optJSONArray("seasons")?.optJSONObject(0)
+            ?.let { parseEpisodes(it.optJSONArray("episodes")) }
+        if (!seasonEps.isNullOrEmpty()) return seasonEps
+        parseEpisodesFromModules(json.optJSONArray("modules"))
     }.getOrDefault(emptyList())
 }
+
