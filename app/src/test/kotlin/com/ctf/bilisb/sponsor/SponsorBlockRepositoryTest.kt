@@ -197,5 +197,17 @@ class SponsorBlockRepositoryTest {
             submitCalls += submission to ignoreCache
             return submitResult
         }
+
+        // 投票/统计不参与本文件的缓存用例,给出确定的默认实现即可。
+        override fun voteOnSegment(
+            segmentUuid: String,
+            userId: String,
+            type: Int,
+        ): SponsorBlockClient.VoteResult = SponsorBlockClient.VoteResult(200, null)
+
+        override fun fetchUserContributionStats(userId: String): SponsorBlockClient.UserStatsResult =
+            SponsorBlockClient.UserStatsResult.Success(
+                SponsorBlockClient.UserContributionStats(viewCount = 0, minutesSaved = 0.0),
+            )
     }
 }

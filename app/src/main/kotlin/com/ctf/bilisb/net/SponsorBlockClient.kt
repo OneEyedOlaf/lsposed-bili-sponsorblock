@@ -28,6 +28,20 @@ import org.json.JSONObject
 interface SponsorBlockApi {
     fun fetchSkipSegments(query: SponsorBlockQuery, ignoreCache: Boolean = false): SponsorBlockClient.FetchResult
     fun submitSegment(submission: SponsorBlockSubmission, ignoreCache: Boolean = true): SponsorBlockClient.SubmitResult
+    /**
+     * 对某个片段投票。`type` 按官方语义:1=赞成(upvote),0=反对(downvote)。
+     *
+     * 与 [submitSegment] 一样是**写操作,刻意不自动重试**:IO 异常时无法判断服务端是否
+     * 已经记票,重试会造成重复投票。
+     */
+    fun voteOnSegment(
+        segmentUuid: String,
+        userId: String,
+        type: Int,
+    ): SponsorBlockClient.VoteResult
+
+    /** 提交者贡献统计(被采纳的片段数 / 累计节省分钟数)。两个数字都可能为 0。 */
+    fun fetchUserContributionStats(userId: String): SponsorBlockClient.UserStatsResult
 }
 
 class SponsorBlockClient(
@@ -56,6 +70,37 @@ class SponsorBlockClient(
     ) {
         /** 2xx 即视为成功(不要只认 200)。 */
         val isSuccess: Boolean get() = statusCode in 200..299
+    }
+
+    /**
+     * 投票结果。**刻意不自动重试**(同 [SubmitResult] 的理由:写操作重复执行等于重复投票)。
+     *
+     * @param localDeltaVote 服务端未返回新票数时按 [type] 本地推算的票数变化,
+     *                      用于让 UI 立即反映用户的操作;最终票数以服务端为准。
+     */
+    data class VoteResult(
+        val statusCode: Int,
+        val body: String?,
+        val localDeltaVote: Int = 0,
+    ) {
+        val isSuccess: Boolean get() = statusCode in 200..299
+    }
+
+    /**
+     * 提交者贡献统计。
+     *
+     * @param viewCount 被采纳的片段数(服务端字段 `viewCount`)
+     * @param minutesSaved 累计节省分钟数(服务端字段 `timeSaved`)
+     */
+    data class UserContributionStats(
+        val viewCount: Long,
+        val minutesSaved: Double,
+    )
+
+    sealed interface UserStatsResult {
+        data class Success(val stats: UserContributionStats) : UserStatsResult
+        /** [message] 为空串表示服务端未提供该数字(404),调用方按 0 呈现而非报错。 */
+        data class Failure(val message: String) : UserStatsResult
     }
 
     /**
@@ -328,6 +373,8 @@ class SponsorBlockClient(
             val segments = bucket.optJSONArray("segments") ?: continue
             for (j in 0 until segments.length()) {
                 val segment = parseSegment(segments.optJSONObject(j) ?: continue) ?: continue
+                // 网络层最后一道过滤：enabledCategories 由调用方按四态模式构造
+                // （CategoryModes.enabledCategories），DISABLED 的分类根本不会进这里。
                 if (segment.category !in config.enabledCategories) {
                     continue
                 }
@@ -480,6 +527,113 @@ class SponsorBlockClient(
         return fields.joinToString("&") { (key, value) -> "$key=${encode(value)}" }
     }
 
+
+    /**
+     * 投票:`POST /api/voteOnSponsorTime?UUID=..&userID=..&type=..`
+     *
+     * 参数走 query(官方协议如此),与提交一样用 [redactUserId] 脱敏后再进日志。
+     * 走 **submitExecutor** 而非 fetchExecutor:它是写操作,不应排在慢速拉取后面,
+     * 也不该占用拉取线程的可用性。
+     */
+    override fun voteOnSegment(segmentUuid: String, userId: String, type: Int): VoteResult {
+        if (closed.get()) {
+            log("vote skipped: client closed")
+            return VoteResult(-1, null)
+        }
+        // 入参白名单:只有 0(反对) / 1(赞成) 合法。非法值不发出请求 ——
+        // 服务端可能把未知 type 当作赞成处理,那等于替用户乱投票。
+        if (type !in 0..1) {
+            log("vote rejected: invalid type=$type")
+            return VoteResult(-1, "invalid vote type")
+        }
+        val uuid = segmentUuid.trim()
+        if (uuid.isEmpty()) {
+            log("vote rejected: empty segment UUID")
+            return VoteResult(-1, "empty segment UUID")
+        }
+        return runOn(submitExecutor, "vote", VoteResult(-1, null)) {
+            val url = "${config.serverAddress.trimEnd('/')}/api/voteOnSponsorTime" +
+                "?UUID=${encode(uuid)}&userID=${encode(userId)}&type=$type"
+            val result = sendSubmitRequest(
+                method = METHOD_POST,
+                url = url,
+                body = null,
+                ignoreCache = true,
+            )
+            log("vote ${redactUserId(url)} -> status=${result.statusCode}")
+            // 服务端不返回新票数,本地按 type 推算供 UI 立即反馈。
+            VoteResult(result.statusCode, result.body, localVoteDelta(type))
+        }
+    }
+
+    /**
+     * 贡献统计:两个独立的 GET(`/api/getViewsForUser` + `/api/getSavedTimeForUser`)。
+     *
+     * 逐个请求、各自容错:任一 404 视为 0(服务端没有该用户的数据是正常情况),
+     * 其它非 2xx 才算失败。**不重试** —— 统计是锦上添花,不值得占用拉取重试预算。
+     */
+    override fun fetchUserContributionStats(userId: String): UserStatsResult {
+        if (closed.get()) {
+            return UserStatsResult.Failure("client closed")
+        }
+        val id = userId.trim()
+        if (id.isEmpty()) {
+            return UserStatsResult.Failure("empty user id")
+        }
+        return runOn(fetchExecutor, "userStats", UserStatsResult.Failure("executor rejected")) {
+            val base = config.serverAddress.trimEnd('/')
+            val views = fetchUserStatNumber("$base/api/getViewsForUser?userID=${encode(id)}", "viewCount")
+            if (views is UserStatNumber.Failure) return@runOn UserStatsResult.Failure(views.message)
+            val saved = fetchUserStatNumber("$base/api/getSavedTimeForUser?userID=${encode(id)}", "timeSaved")
+            if (saved is UserStatNumber.Failure) return@runOn UserStatsResult.Failure(saved.message)
+            UserStatsResult.Success(
+                UserContributionStats(
+                    viewCount = (views as UserStatNumber.Success).value.toLong().coerceAtLeast(0L),
+                    minutesSaved = (saved as UserStatNumber.Success).value.coerceAtLeast(0.0),
+                ),
+            )
+        }
+    }
+
+    private sealed interface UserStatNumber {
+        data class Success(val value: Double) : UserStatNumber
+        data class Failure(val message: String) : UserStatNumber
+    }
+
+    /** 单个统计数字的 GET。404 归一为 0([UserStatNumber.Success]),其余非 2xx 才是失败。 */
+    private fun fetchUserStatNumber(url: String, field: String): UserStatNumber {
+        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = METHOD_GET
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+            instanceFollowRedirects = false
+            setRequestProperty("Origin", ORIGIN_HEADER)
+            setRequestProperty("X-EXT-VERSION", EXT_VERSION_HEADER)
+            doInput = true
+        }
+        return try {
+            val status = conn.responseCode
+            if (status == HTTP_NOT_FOUND) {
+                return UserStatNumber.Success(0.0)
+            }
+            if (status !in 200..299) {
+                return UserStatNumber.Failure("HTTP $status")
+            }
+            val body = readBody(conn, status, "userStats") ?: return UserStatNumber.Success(0.0)
+            val value = runCatching {
+                org.json.JSONObject(body).optDouble(field, 0.0)
+            }.getOrElse {
+                log("userStats parse failed field=$field: ${it.message}")
+                return UserStatNumber.Success(0.0)
+            }
+            if (!value.isFinite()) return UserStatNumber.Success(0.0)
+            UserStatNumber.Success(value)
+        } catch (e: IOException) {
+            UserStatNumber.Failure(e.message ?: e.javaClass.simpleName)
+        } finally {
+            conn.disconnect()
+        }
+    }
     private fun submitEndpoint(): String = "${config.serverAddress.trimEnd('/')}/api/skipSegments"
 
     private fun encode(value: String): String {
@@ -507,6 +661,23 @@ class SponsorBlockClient(
 
     private fun log(message: String) {
         logger(message)
+    }
+
+    /**
+     * 投票后 UI 立即反馈用的票数增量：赞成 +1、反对 −1。
+     *
+     * 服务端 `voteOnSponsorTime` 不回新票数，所以这是**本地推算**，最终票数以服务端为准。
+     * 单独抽成 companion 里的纯函数是为了让它在不联网的前提下被测试——
+     * 之前的用例靠 `voteOnSegment("", …)` 拿到结果，但空 UUID 会在入参校验处就返回，
+     * `localDeltaVote` 恒为 0，等于什么都没验（见 `SponsorBlockClientTest`）。
+     *
+     * 非法 type 返回 0：与 [voteOnSegment] 的入参白名单保持一致——
+     * 既然请求不会发出，就不能谎报有票数变化。
+     */
+    internal fun localVoteDelta(type: Int): Int = when (type) {
+        1 -> 1
+        0 -> -1
+        else -> 0
     }
 
     /** 停掉拉取/提交 executor(幂等)。关闭后新的请求会直接返回失败结果。 */
@@ -561,6 +732,8 @@ class SponsorBlockClient(
 
         private const val HTTP_METHOD_NOT_ALLOWED = 405
         private const val HTTP_NOT_IMPLEMENTED = 501
+        /** 服务端没有该用户/该片段的数据:不是错误,按 0 处理。 */
+        private const val HTTP_NOT_FOUND = 404
 
         /** 响应体读取上限 4MB,超出截断并记 warn。 */
         private const val MAX_RESPONSE_BYTES = 4 * 1024 * 1024
