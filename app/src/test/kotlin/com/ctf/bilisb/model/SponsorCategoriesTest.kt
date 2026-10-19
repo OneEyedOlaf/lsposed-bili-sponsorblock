@@ -1,6 +1,7 @@
 package com.ctf.bilisb.model
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -16,11 +17,12 @@ import org.junit.Test
 class SponsorCategoriesTest {
 
     @Test
-    fun `顺序稳定且为九个分类`() {
+    fun `顺序稳定且为十个分类`() {
         assertEquals(
             listOf(
                 "sponsor", "selfpromo", "interaction", "intro", "outro",
-                "preview", "music_offtopic", "filler", SponsorCategories.POI_HIGHLIGHT,
+                "preview", "music_offtopic", "filler", SponsorCategories.PADDING,
+                SponsorCategories.POI_HIGHLIGHT,
             ),
             SponsorCategories.ordered.map { it.id },
         )
@@ -100,5 +102,62 @@ class SponsorCategoriesTest {
             SponsorCategories.settingsKeys.entries.associate { (k, v) -> v to k },
             SponsorCategories.settingsKeysInverted,
         )
+    }
+
+    /** 默认模式表必须与 ordered 一一对应（同序、无缺、无多），SettingsKeys 的 init 守卫也查这一条。 */
+    @Test
+    fun `默认模式表与 ordered 同序且一一对应`() {
+        assertEquals(
+            SponsorCategories.ordered.map { it.id },
+            SponsorCategories.defaultModes.keys.toList(),
+        )
+        SponsorCategories.ordered.forEach { category ->
+            assertTrue("分类必须有默认模式: ${category.id}", SponsorCategories.defaultModes.containsKey(category.id))
+        }
+    }
+
+    /** 默认模式的取值是产品决策，钉死它们：漂移会让「重装后行为变了」变得没法解释。 */
+    @Test
+    fun `默认模式表取值`() {
+        assertEquals(
+            mapOf(
+                "sponsor" to CategoryMode.AUTO_SKIP,
+                "selfpromo" to CategoryMode.MANUAL_SKIP,
+                "interaction" to CategoryMode.MANUAL_SKIP,
+                "intro" to CategoryMode.MANUAL_SKIP,
+                "outro" to CategoryMode.MANUAL_SKIP,
+                "preview" to CategoryMode.SHOW_OVERLAY,
+                "music_offtopic" to CategoryMode.AUTO_SKIP,
+                "filler" to CategoryMode.DISABLED,
+                SponsorCategories.PADDING to CategoryMode.AUTO_SKIP,
+                SponsorCategories.POI_HIGHLIGHT to CategoryMode.SHOW_OVERLAY,
+            ),
+            SponsorCategories.defaultModes,
+        )
+    }
+
+    /** poi_highlight 默认只标记：SkipDecision 硬排除它做跳过决策，模式必须与之一致。 */
+    @Test
+    fun `poi_highlight 默认只标记不跳过`() {
+        assertEquals(CategoryMode.SHOW_OVERLAY, SponsorCategories.defaultModes[SponsorCategories.POI_HIGHLIGHT])
+        assertFalse(CategoryMode.AUTO_SKIP == SponsorCategories.defaultModes[SponsorCategories.POI_HIGHLIGHT])
+    }
+
+    /** persistedValue 是存储契约：唯一且稳定，改它等于让所有已保存的选择失效。 */
+    @Test
+    fun `CategoryMode 的 persistedValue 唯一`() {
+        val values = CategoryMode.entries.map { it.persistedValue }
+        assertEquals(values.size, values.toSet().size)
+        assertEquals(setOf("disabled", "show_overlay", "manual_skip", "auto_skip"), values.toSet())
+    }
+
+    /** fromPersisted 的兜底语义：null / 空 / 未知 → default，绝不抛异常。 */
+    @Test
+    fun `fromPersisted 对非法值回退 default`() {
+        listOf(null, "", "   ", "nope", "AUTO_SKIP").forEach { raw ->
+            assertEquals(CategoryMode.SHOW_OVERLAY, CategoryMode.fromPersisted(raw, CategoryMode.SHOW_OVERLAY))
+        }
+        assertEquals(CategoryMode.AUTO_SKIP, CategoryMode.fromPersisted("auto_skip", CategoryMode.SHOW_OVERLAY))
+        assertEquals(CategoryMode.DISABLED, CategoryMode.fromPersisted("  disabled  ", CategoryMode.AUTO_SKIP))
     }
 }

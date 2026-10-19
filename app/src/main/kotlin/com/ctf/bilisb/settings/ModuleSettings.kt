@@ -167,6 +167,15 @@ data class SettingsSnapshot(
     val showSubmitButton: Boolean,
     /** 分类标记颜色:category 字符串 → ARGB int。缺省由 CATEGORY_COLOR_DEFAULTS 填充。 */
     val categoryColors: Map<String, Int>,
+    /**
+     * 分类处理模式:category 字符串 → [com.ctf.bilisb.model.CategoryMode]。
+     *
+     * 消费端一律经 [CategoryModes.effectiveMode] 取「生效模式」而不是直接读这张表 ——
+     * 全局 auto_skip / manual_skip 关掉时该表里的 AUTO_SKIP/MANUAL_SKIP 要降级成只标记。
+     * 默认空表仅为兼容既有构造调用（测试里手写快照），[com.ctf.bilisb.settings.SettingsCodec]
+     * 的每条通道都会把它填满。
+     */
+    val categoryModes: Map<String, com.ctf.bilisb.model.CategoryMode> = emptyMap(),
     // ---- B 站增强功能(全部默认关闭) ----
     val ipLocation: Boolean = false,
     val hideTriple: Boolean = false,

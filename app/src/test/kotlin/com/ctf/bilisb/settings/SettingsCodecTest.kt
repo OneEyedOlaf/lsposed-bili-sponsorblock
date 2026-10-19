@@ -2,6 +2,8 @@ package com.ctf.bilisb.settings
 
 import android.os.Bundle
 import org.json.JSONObject
+import com.ctf.bilisb.model.CategoryMode
+import com.ctf.bilisb.model.SponsorCategories
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -74,7 +76,9 @@ class SettingsCodecTest {
             cacheTtlMs = 90L * 60_000L,
             userId = "0123456789abcdef0123456789abcdef",
             defaultSubmitCategory = "intro",
-            enabledCategories = setOf("intro", "outro"),
+            // cat_* 由 categoryModes 派生：把 sponsor 置为 DISABLED 才与 enabledCategories 一致。
+            categoryModes = SettingsSnapshot.DEFAULT.categoryModes + ("sponsor" to CategoryMode.DISABLED),
+            enabledCategories = (SponsorCategories.ordered.map { it.id } - "sponsor").toSet(),
             showTimeDeduction = false,
             categoryColors = SettingsSnapshot.DEFAULT.categoryColors + ("sponsor" to 0xFF123456.toInt()),
         )
@@ -225,8 +229,10 @@ class SettingsCodecTest {
         cacheTtlMs = 90L * 60_000L,
         userId = "0123456789abcdef0123456789abcdef",
         defaultSubmitCategory = "intro",
-        enabledCategories = setOf("intro", "outro"),
         showToast = false,
+        // cat_* 现在由 categoryModes 派生（write 通道），所以 enabledCategories 必须与
+        // 下面的 categoryModes 一致，否则整对象往返会因为「派生出的 cat_* 读回来不同」而失败。
+        enabledCategories = (SponsorCategories.ordered.map { it.id } - "sponsor").toSet(),
         showSeekbarMarker = false,
         showTimeDeduction = false,
         showSkipStats = false,
@@ -236,8 +242,70 @@ class SettingsCodecTest {
             if (category == "sponsor") 0xFF123456.toInt() else 0xFF654321.toInt()
         },
         ipLocation = true,
+        // 四态模式：全部拨到**非默认**值,任何分类漏进编解码都会在这里退回默认 → 整对象等价失败。
+        categoryModes = com.ctf.bilisb.model.SponsorCategories.ordered.associate { category ->
+            category.id to when (category.id) {
+                "sponsor" -> com.ctf.bilisb.model.CategoryMode.DISABLED
+                "poi_highlight" -> com.ctf.bilisb.model.CategoryMode.MANUAL_SKIP
+                else -> com.ctf.bilisb.model.CategoryMode.AUTO_SKIP
+            }
+        },
         shareQq = true,
     )
+
+    /**
+     * 非默认四态的 Map 往返（`snapshotToMap` → `snapshotFromMap`）逐项一致。
+     *
+     * 与整对象等价互补：这里断言的是**具体映射**（存什么串、读回什么枚举），
+     * 而不是「整个对象没变」——写错 persistedValue 时整对象等价会先红，
+     * 但这条能给出更直白的失败信息。
+     */
+    @Test
+    fun nonDefaultCategoryModesSurviveMapRoundTrip() {
+        val modes = mapOf(
+            "sponsor" to CategoryMode.MANUAL_SKIP,
+            "selfpromo" to CategoryMode.SHOW_OVERLAY,
+            "interaction" to CategoryMode.DISABLED,
+            "intro" to CategoryMode.AUTO_SKIP,
+            "outro" to CategoryMode.MANUAL_SKIP,
+            "preview" to CategoryMode.DISABLED,
+            "music_offtopic" to CategoryMode.SHOW_OVERLAY,
+            "filler" to CategoryMode.AUTO_SKIP,
+            SponsorCategories.PADDING to CategoryMode.DISABLED,
+            SponsorCategories.POI_HIGHLIGHT to CategoryMode.AUTO_SKIP,
+        )
+        // enabledCategories 必须与 modes 一致（写通道的 cat_* 只由 modes 派生），
+        // 否则快照本身就自相矛盾：interaction/preview 是 DISABLED 却仍留在启用集合里，
+        // 往返后按 cat_* 重建的集合会把它们剔掉 → 整对象等价失败。
+        val original = SettingsSnapshot.DEFAULT.copy(
+            categoryModes = modes,
+            enabledCategories = modes.filterValues { it != CategoryMode.DISABLED }.keys,
+        )
+
+        val written = SettingsCodec.snapshotToMap(original)
+        assertEquals(CategoryMode.MANUAL_SKIP.persistedValue, written[SettingsKeys.categoryModeKey("sponsor")])
+        assertEquals(CategoryMode.AUTO_SKIP.persistedValue, written[SettingsKeys.categoryModeKey("intro")])
+        // cat_* 仍然写，且等于 (mode != DISABLED)
+        assertEquals(true, written[SettingsKeys.CAT_SPONSOR])
+        assertEquals(false, written[SettingsKeys.CAT_INTERACTION])
+
+        val restored = SettingsCodec.snapshotFromMap(written)
+        assertEquals(modes, restored.categoryModes)
+        assertEquals(original, restored)
+    }
+
+    /** 写通道不能丢分类：快照里没有某个分类时退回它的默认模式，而不是缺键。 */
+    @Test
+    fun categoryModeKeyIsAlwaysWritten() {
+        val written = SettingsCodec.snapshotToMap(SettingsSnapshot.DEFAULT.copy(categoryModes = emptyMap()))
+        SponsorCategories.ordered.forEach { category ->
+            assertEquals(
+                "分类 ${category.id} 的 category_mode_* 必须落盘",
+                SponsorCategories.defaultModes[category.id]!!.persistedValue,
+                written[SettingsKeys.categoryModeKey(category.id)],
+            )
+        }
+    }
 
     /**
      * **全字段非默认值**往返（R1 字段表的防漏网用例）。
@@ -260,7 +328,8 @@ class SettingsCodecTest {
             cacheTtlMs = 45L * 60_000L,
             userId = "fedcba9876543210fedcba9876543210",
             defaultSubmitCategory = "outro",
-            enabledCategories = setOf("sponsor", "outro"),
+            // 同 richSnapshot：cat_* 由 categoryModes 派生，enabledCategories 必须一致。
+            enabledCategories = SponsorCategories.ordered.mapTo(linkedSetOf()) { it.id },
             showToast = false,
             showSeekbarMarker = false,
             showTimeDeduction = false,
@@ -306,7 +375,16 @@ class SettingsCodecTest {
     fun mapKeySetIsPinned() {
         // 集合比较（顺序无关）；键总数也钉死，防止无意增删
         val keys = SettingsCodec.snapshotToMap(SettingsSnapshot.DEFAULT).keys
-        assertEquals(58, keys.size)
+        assertEquals(70, keys.size)
+        assertEquals(
+            setOf(
+                "category_mode_sponsor", "category_mode_selfpromo", "category_mode_interaction",
+                "category_mode_intro", "category_mode_outro", "category_mode_preview",
+                "category_mode_music_offtopic", "category_mode_filler", "category_mode_padding",
+                "category_mode_poi_highlight",
+            ),
+            keys.filter { it.startsWith("category_mode_") }.toSet(),
+        )
         assertEquals(
             setOf(
                 "enabled", "auto_skip", "manual_skip", "mute_segments",
@@ -314,11 +392,17 @@ class SettingsCodecTest {
                 "cache_ttl_minutes", "user_id", "default_submit_category",
                 "cat_sponsor", "cat_selfpromo", "cat_interaction", "cat_intro",
                 "cat_outro", "cat_preview", "cat_music_offtopic", "cat_filler",
+                "cat_padding",
                 "cat_poi_highlight",
                 "show_toast", "show_seekbar_marker", "show_time_deduction",
                 "show_skip_stats", "show_submit_button",
                 "color_sponsor", "color_selfpromo", "color_interaction", "color_intro",
+                "category_mode_sponsor", "category_mode_selfpromo", "category_mode_interaction",
+                "category_mode_intro", "category_mode_outro", "category_mode_preview",
+                "category_mode_music_offtopic", "category_mode_filler", "category_mode_padding",
+                "category_mode_poi_highlight",
                 "color_outro", "color_preview", "color_music_offtopic", "color_filler",
+                "color_padding",
                 "color_poi_highlight",
                 "enhance_ip_location", "enhance_hide_triple", "enhance_hide_up_prompt",
                 "enhance_hide_vote", "enhance_no_auto_refresh", "enhance_share_qq",

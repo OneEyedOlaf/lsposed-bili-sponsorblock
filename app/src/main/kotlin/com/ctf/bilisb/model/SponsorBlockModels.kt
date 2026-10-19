@@ -58,6 +58,7 @@ data class SponsorBlockConfig(
         "preview",
         "music_offtopic",
         "filler",
+        "padding",
     ),
     val enabledActionTypes: Set<String> = setOf("skip", "poi", "mute"),
 ) {

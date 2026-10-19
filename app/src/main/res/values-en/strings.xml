@@ -113,6 +113,7 @@
     <string name="category_hint_preview">Recap</string>
     <string name="category_hint_music_offtopic">Non-music parts of a music video</string>
     <string name="category_hint_filler">Jokes, repeated filler</string>
+    <string name="category_hint_padding">Blank frames at the start or end</string>
     <string name="category_hint_poi_highlight">Highlight moments</string>
 
     <!-- Category display names (the Chinese ones in SponsorCategories are the canonical
@@ -125,7 +126,20 @@
     <string name="category_name_preview">Preview/recap</string>
     <string name="category_name_music_offtopic">Non-music section</string>
     <string name="category_name_filler">Filler</string>
+    <string name="category_name_padding">Padding</string>
     <string name="category_name_poi_highlight">Highlight</string>
+
+    <!-- Per-category mode (dialog option labels) -->
+    <string name="category_mode_disabled">Off</string>
+    <string name="category_mode_show_overlay">Mark only</string>
+    <string name="category_mode_manual_skip">Manual skip</string>
+    <string name="category_mode_auto_skip">Auto skip</string>
+
+    <!-- Per-category mode (current value on the category row) -->
+    <string name="category_mode_value_disabled">Off</string>
+    <string name="category_mode_value_show_overlay">Marker only</string>
+    <string name="category_mode_value_manual_skip">Skip button shown</string>
+    <string name="category_mode_value_auto_skip">Skipped automatically</string>
 
     <!-- Color picker -->
     <string name="color_custom_hex">Custom (hex): </string>
