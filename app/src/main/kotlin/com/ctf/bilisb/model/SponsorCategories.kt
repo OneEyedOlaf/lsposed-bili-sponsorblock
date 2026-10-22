@@ -16,6 +16,9 @@ object SponsorCategories {
     /** POI（精彩时刻）片段的 actionType/category 字面量。 */
     const val POI_HIGHLIGHT = "poi_highlight"
 
+    /** padding（前后黑）片段的 category 字面量。 */
+    const val PADDING = "padding"
+
     /** 无分类匹配时的兜底颜色（琥珀色）。 */
     const val FALLBACK_COLOR = 0xFFFFC400.toInt()
 
@@ -51,6 +54,11 @@ object SponsorCategories {
         Category("preview", "回顾/概要", 0xFFFF8000.toInt(), "cat_preview"),
         Category("music_offtopic", "非音乐片段", 0xFFFF00B4.toInt(), "cat_music_offtopic"),
         Category("filler", "填充内容", 0xFF7F00FF.toInt(), "cat_filler"),
+        // padding(前后黑): 官方 SponsorBlock 分类, 原实现漏掉了它 —— 前后黑片段会落到
+        // FALLBACK_COLOR 琥珀色且不受任何分类开关控制。默认 AUTO_SKIP（对齐官方扩展）。
+        // 配色取中性灰蓝而不是纯黑：进度条底色本身就是深色，0xFF111111 这种近黑色
+        // 在深色主题下与底色几乎无法区分，标记等于看不见。
+        Category(PADDING, "前后黑", 0xFF607D8B.toInt(), "cat_padding"),
         Category(POI_HIGHLIGHT, "精彩时刻", 0xFFFF1E1E.toInt(), "cat_poi_highlight"),
     )
 
@@ -69,6 +77,36 @@ object SponsorCategories {
 
     /** category 字面量 → 设置开关键。 */
     val settingsKeys: Map<String, String> = ordered.associate { it.id to it.settingsKey }
+    /**
+     * category 字面量 → **默认模式**，即「读不到任何存储值时」的权威来源。
+     *
+     * 生效场景只有两类，都必须读这里（不要各处硬编码）：
+     *   - 写通道（[com.ctf.bilisb.settings.SettingsCodec.snapshotToMap]）：快照里的
+     *     `categoryModes` 缺某个分类时，用它补出该分类的 `category_mode_*` 键；
+     *   - 读通道（`SettingsCodec.modesFromRaw`）：`category_mode_*` 键**存在但值损坏**
+     *     时回退到它（用户表达过偏好，只是值坏了）。
+     *
+     * **键根本不存在**（全新安装）走 [CategoryModes.legacyCategoryMode] 而不是这里 ——
+     * 那是「升级老安装」的语义，必须与四态化之前的行为逐格一致，见该函数文档。
+     * 两者取值可以不同（例如 `filler` 默认 DISABLED，legacy 派生在默认开关下给
+     * AUTO_SKIP），因为前者是「从没装过」，后者是「装了旧版」。
+     * 由 `CategoryModeMigrationTest` 分别钉死。
+     *
+     * 与 [ordered] 同序新增；`filler` 默认关闭（填充内容多为内容而非广告，
+     * 命中率高且容易误伤），`poi_highlight` 只标记不跳（精彩时刻是内容不是广告）。
+     */
+    val defaultModes: Map<String, CategoryMode> = linkedMapOf(
+        "sponsor" to CategoryMode.AUTO_SKIP,
+        "selfpromo" to CategoryMode.MANUAL_SKIP,
+        "interaction" to CategoryMode.MANUAL_SKIP,
+        "intro" to CategoryMode.MANUAL_SKIP,
+        "outro" to CategoryMode.MANUAL_SKIP,
+        "preview" to CategoryMode.SHOW_OVERLAY,
+        "music_offtopic" to CategoryMode.AUTO_SKIP,
+        "filler" to CategoryMode.DISABLED,
+        PADDING to CategoryMode.AUTO_SKIP,
+        POI_HIGHLIGHT to CategoryMode.SHOW_OVERLAY,
+    )
 
     /** 设置开关键 → category 字面量（设置存储按 key 持久化，读取时用它反转回来）。 */
     val settingsKeysInverted: Map<String, String> = ordered.associate { it.settingsKey to it.id }
@@ -91,6 +129,7 @@ object SponsorCategories {
         "preview" to com.ctf.bilisb.R.string.category_name_preview,
         "music_offtopic" to com.ctf.bilisb.R.string.category_name_music_offtopic,
         "filler" to com.ctf.bilisb.R.string.category_name_filler,
+        PADDING to com.ctf.bilisb.R.string.category_name_padding,
         POI_HIGHLIGHT to com.ctf.bilisb.R.string.category_name_poi_highlight,
     )
 

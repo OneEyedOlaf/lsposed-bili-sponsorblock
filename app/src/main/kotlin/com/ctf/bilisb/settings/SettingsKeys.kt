@@ -100,6 +100,7 @@ object SettingsKeys {
     const val CAT_PREVIEW = "cat_preview"
     const val CAT_MUSIC_OFFTOPIC = "cat_music_offtopic"
     const val CAT_FILLER = "cat_filler"
+    const val CAT_PADDING = "cat_padding"
     const val CAT_POI_HIGHLIGHT = "cat_poi_highlight"
 
     // B 站增强功能(移植自 BiliTamer,MIT):全部默认关闭,按需开启
@@ -127,6 +128,12 @@ object SettingsKeys {
 
     // 分类标记颜色:key 为 "color_<category>",值为 "#RRGGBB" hex 字符串。
     const val COLOR_PREFIX = "color_"
+
+    // 分类模式(四态):key 为 "category_mode_<category>",值为 [com.ctf.bilisb.model.CategoryMode.persistedValue]。
+    // 与 cat_* 布尔并存 —— cat_* 继续读写(老安装 / 外部工具链 / 降级路径都还认它),
+    // 且它的值由模式派生(mode != DISABLED),两处不一致时以 category_mode_* 为准。
+    const val CATEGORY_MODE_PREFIX = "category_mode_"
+    fun categoryModeKey(category: String): String = CATEGORY_MODE_PREFIX + category
     fun colorKey(category: String): String = COLOR_PREFIX + category
 
     /** 类别 → 默认标记颜色（hex）。**单一事实来源是 [com.ctf.bilisb.model.SponsorCategories]**，
@@ -144,6 +151,7 @@ object SettingsKeys {
         CAT_PREVIEW to "preview",
         CAT_MUSIC_OFFTOPIC to "music_offtopic",
         CAT_FILLER to "filler",
+        CAT_PADDING to com.ctf.bilisb.model.SponsorCategories.PADDING,
         CAT_POI_HIGHLIGHT to com.ctf.bilisb.model.SponsorCategories.POI_HIGHLIGHT,
     )
 
@@ -164,6 +172,12 @@ object SettingsKeys {
         require(CATEGORY_COLOR_DEFAULTS.keys.toList() == declaredOrder) {
             "默认颜色表与 SponsorCategories 的分类列表不一致:" +
                 " ${CATEGORY_COLOR_DEFAULTS.keys} vs $declaredOrder"
+        }
+        // 每个分类都必须有默认模式（读取端缺键时用它兜底，漏一个就是「某个分类静默失效」）。
+        val defaultModes = com.ctf.bilisb.model.SponsorCategories.defaultModes
+        require(defaultModes.keys.toList() == declaredOrder) {
+            "默认模式表与 SponsorCategories 的分类列表不一致:" +
+                " ${defaultModes.keys} vs $declaredOrder"
         }
     }
 
