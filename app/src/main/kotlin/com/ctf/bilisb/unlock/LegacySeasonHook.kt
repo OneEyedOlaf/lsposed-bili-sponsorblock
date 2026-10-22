@@ -17,6 +17,9 @@ internal object LegacySeasonHook {
 
     fun install(module: XposedModule, cl: ClassLoader): Boolean {
         val api = runCatching { cl.loadClass(HostTargets.LEGACY_SECTION_API) }.getOrNull() ?: return false
+        // 安装失败必须返回 false：调用方据此决定是否跳过 SeasonMoss 原路径，
+        // 失败也报 true 会把兜底一并吞掉。
+        var installed = false
         runCatching {
             val factory = cl.loadClass(HostTargets.LEGACY_RETROFIT_FACTORY)
             val create = factory.declaredMethods.single {
@@ -47,8 +50,9 @@ internal object LegacySeasonHook {
                 }.getOrDefault(original)
             }
             HookProbe.ok(module, "seasonMoss", "legacy REST ${api.name}#${HostTargets.LEGACY_SECTION_METHOD}")
+            installed = true
         }.onFailure { HookProbe.miss(module, "seasonMoss", "legacy REST: ${it.javaClass.simpleName}: ${it.message}") }
-        return true
+        return installed
     }
 
     private fun transform(module: XposedModule, cl: ClassLoader, sid: Int, original: Any?): Any? {
