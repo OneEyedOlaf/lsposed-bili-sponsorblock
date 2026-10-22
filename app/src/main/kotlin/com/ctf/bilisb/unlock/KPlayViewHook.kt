@@ -24,6 +24,10 @@ import java.lang.reflect.Proxy
  * 3.20.4 的等效入口为 kntr.base.moss.api.c.d（六参）。通过宿主 ProtoBuf 和
  * serializer 将 K 模型转换到普通 protobuf 响应处理管线，再还原为宿主 K 类型。
  * 复用 [PlayViewHook.ResponseTransformer] 的受限判定、超时和原响应回退；未启用时只观测。
+ *
+ * 注意：请求/响应变换只对六参 layout 启用。七参 `xr1.j`（6.5.0/6.6.0）在 master 上
+ * 一直是仅观测（替换形态未定），且 K 变换尚未在任何版本端到端验收过，不得在
+ * 未做旧版真机回归前把变换带到旧版；`xr1.j` 维持仅观测与原描述符判定。
  */
 object KPlayViewHook {
 
@@ -31,29 +35,30 @@ object KPlayViewHook {
 
     fun install(module: XposedModule, cl: ClassLoader) {
         try {
+            // 每条候选带上它所属 layout：六参（3.20.4 kntr）才允许变换，七参 xr1.j 仅观测。
             val candidates = HostTargets.K_SEND_LAYOUTS.flatMap { (name, method, arity) ->
                 val cls = runCatching { Class.forName(name, false, cl) }.getOrNull()
                 cls?.declaredMethods.orEmpty().filter {
                     it.name == method && it.parameterTypes.size == arity &&
                         it.parameterTypes[4].isInterface && it.parameterTypes[4].methods.any { cb -> cb.name == "onNext" }
-                }
+                }.map { it to (arity == 6) }
             }
             if (candidates.isEmpty()) {
                 HookProbe.miss(module, "k:send", "No supported K send signature")
                 return
             }
-            for (m in candidates) {
+            for ((m, allowTransform) in candidates) {
                 runCatching { m.isAccessible = true }
                 runCatching { module.deoptimize(m) }
-                hookOne(module, cl, m)
+                hookOne(module, cl, m, allowTransform)
             }
-            HookProbe.ok(module, "k:send", candidates.joinToString(", ") { "${it.name}(${it.parameterTypes.size})" })
+            HookProbe.ok(module, "k:send", candidates.joinToString(", ") { (m, allow) -> "${m.name}(${m.parameterTypes.size}, transform=$allow)" })
         } catch (t: Throwable) {
             HookProbe.miss(module, "k:send", "install threw: ${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
-    private fun hookOne(module: XposedModule, cl: ClassLoader, m: Method) {
+    private fun hookOne(module: XposedModule, cl: ClassLoader, m: Method, allowTransform: Boolean) {
         module.hook(m)
             .setPriority(XposedInterface.PRIORITY_DEFAULT)
             .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -62,7 +67,7 @@ object KPlayViewHook {
                 val descriptor = args.getOrNull(0)
                 val req = args.getOrNull(1)
                 val callback = args.getOrNull(4)
-                val method = describeMethod(descriptor)
+                val method = describeMethod(descriptor, strict = allowTransform)
                 if (method != PLAY_VIEW_UNITE) return@intercept chain.proceed()
                 HookProbe.first(module, "k:req", 5) {
                     "method=$method argc=${args.size} req=${req?.javaClass?.simpleName} " +
@@ -73,7 +78,8 @@ object KPlayViewHook {
                 }
                 if (callback == null) return@intercept chain.proceed()
                 var effectiveReq = req
-                val bridge = runCatching {
+                // 仅观测的 layout（xr1.j）不建桥：回调只打探针日志，请求/响应原样转发。
+                val bridge = if (!allowTransform) null else runCatching {
                     val config = UnlockConfig.load(module)
                     if (!config.enabled || config.servers.isEmpty()) return@runCatching null
                     val proto = args.getOrNull(6) ?: cl.loadClass("kotlinx.serialization.protobuf.ProtoBuf")
@@ -166,11 +172,17 @@ object KPlayViewHook {
         }.getOrNull()
     }
 
-    /** 方法描述符 `xr1.g`：b=serviceName, c=methodName（toString 也一并记下便于核对）。 */
-    private fun describeMethod(descriptor: Any?): String {
+    /**
+     * 方法描述符判定。六参（3.20.4）用严格门：toString 须同时含完整服务名与方法名；
+     * 七参 `xr1.g` 维持 master 原判定（只含方法名即命中）——其 toString 格式未经
+     * 证实包含完整服务名，收紧会让旧版 K 观测静默整体失效。
+     */
+    private fun describeMethod(descriptor: Any?, strict: Boolean): String {
         if (descriptor == null) return ""
         val text = runCatching { descriptor.toString() }.getOrDefault("")
-        return if (text.contains("bilibili.app.playerunite.v1") && text.contains(PLAY_VIEW_UNITE)) PLAY_VIEW_UNITE else ""
+        val matched = text.contains(PLAY_VIEW_UNITE) &&
+            (!strict || text.contains("bilibili.app.playerunite.v1"))
+        return if (matched) PLAY_VIEW_UNITE else ""
     }
 
     private fun streamCount(reply: Any?): Int {
