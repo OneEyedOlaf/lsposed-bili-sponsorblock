@@ -277,6 +277,10 @@ object IpLocationHooks {
                 it.name == HostTargets.LEGACY_METADATA_METHOD && it.parameterTypes.isEmpty() &&
                     it.returnType == ByteArray::class.java
             }) return false
+        // 只有整条 legacy 链路真正装上才算命中：一旦内部失败（短名类撞名、
+        // 拦截器/Call 形状不符等），必须返回 false 让 install() 继续走
+        // moss/KMP 原路径，否则旧版本（6.5.0/6.6.0）的 IP 属地会静默失效且无回退。
+        var installed = false
         runCatching {
             val interceptor = Class.forName(HostTargets.LEGACY_GRPC_INTERCEPTOR, false, cl)
             val callClass = Class.forName(HostTargets.LEGACY_GRPC_HEADER_CALL, false, cl)
@@ -310,8 +314,9 @@ object IpLocationHooks {
             identityReady.set(true)
             HookProbe.ok(module, "ip.identityProvider", "${provider.name} n/k")
             HookProbe.ok(module, "ip.mossScope", "${callClass.name}#${start.name} (per-call service scope)")
+            installed = true
         }.onFailure { HookProbe.miss(module, "ip.legacyIdentity", "${it.javaClass.simpleName}: ${it.message}") }
-        return true
+        return installed
     }
 
     // ------------------------------------------------------------------ KMP 头提供者兜底
