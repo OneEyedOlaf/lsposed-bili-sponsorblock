@@ -113,6 +113,7 @@
     <string name="category_hint_preview">前情回顾</string>
     <string name="category_hint_music_offtopic">MV中非音乐部分</string>
     <string name="category_hint_filler">笑话、重复片段</string>
+    <string name="category_hint_padding">片头片尾黑屏 / 静止帧</string>
     <string name="category_hint_poi_highlight">视频精彩部分</string>
 
     <!-- 分类显示名（UI 用；模型层 SponsorCategories 里那份是给日志与存储的规范名）-->
@@ -124,7 +125,20 @@
     <string name="category_name_preview">回顾/概要</string>
     <string name="category_name_music_offtopic">非音乐片段</string>
     <string name="category_name_filler">填充内容</string>
+    <string name="category_name_padding">前后黑</string>
     <string name="category_name_poi_highlight">精彩时刻</string>
+
+    <!-- 分类四态模式（对话框选项名） -->
+    <string name="category_mode_disabled">关闭</string>
+    <string name="category_mode_show_overlay">只标记</string>
+    <string name="category_mode_manual_skip">手动跳过</string>
+    <string name="category_mode_auto_skip">自动跳过</string>
+
+    <!-- 分类四态模式（分类行内的当前值） -->
+    <string name="category_mode_value_disabled">已关闭</string>
+    <string name="category_mode_value_show_overlay">只标记进度条</string>
+    <string name="category_mode_value_manual_skip">显示跳过按钮</string>
+    <string name="category_mode_value_auto_skip">自动跳过</string>
 
     <!-- 颜色选择 -->
     <string name="color_custom_hex">自定义 (hex)：</string>

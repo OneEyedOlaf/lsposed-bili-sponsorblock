@@ -3,6 +3,8 @@ package com.ctf.bilisb.settings
 import android.content.SharedPreferences
 import android.os.Bundle
 import org.json.JSONObject
+import com.ctf.bilisb.model.CategoryMode
+import com.ctf.bilisb.model.SponsorCategories
 
 /**
  * 设置快照 ↔ 各存储通道的编解码。
@@ -21,11 +23,11 @@ import org.json.JSONObject
  *
  * 加一个设置项只剩两处：[SettingsSnapshot] 属性 + [FIELDS] 一条目；
  * 防漏网由 `SettingsCodecFieldParityTest` 的「全字段非默认值往返」用例兜底。
- *
- * **复合字段**（enabledCategories ← cat_* 九键、categoryColors ← color_* 九键）
- * 不进表：它们已是 [SettingsKeys.CATEGORY_MAP] / [SettingsKeys.CATEGORY_COLOR_DEFAULTS]
- * 单源表的派生，各通道的读取循环保持显式（读取语义不同：prefs 读 Boolean，
- * Map 读严格 String）。
+ * **复合字段**（enabledCategories ← cat_* 十键、categoryColors ← color_* 十键、
+ * categoryModes ← category_mode_* 十键）不进表：它们已是 [SettingsKeys.CATEGORY_MAP] /
+ * [SettingsKeys.CATEGORY_COLOR_DEFAULTS] / [com.ctf.bilisb.model.SponsorCategories.defaultModes]
+ * 单源表的派生，各通道的读取循环保持显式（读取语义不同：prefs 读 Boolean / String，
+ * Map 读严格 Boolean / String；categoryModes 还多一层「键缺失 → legacy 派生」）。
  *
  * ## 通道语义（由各 FieldDef 条目实现，历史行为不变）
  *
@@ -37,6 +39,22 @@ import org.json.JSONObject
 object SettingsCodec {
 
     // ---------------------------------------------------------------- 字段定义表
+
+    /**
+     * `modesFromRaw` 的哨兵值：表示「该分类的 `category_mode_*` 键在存储里**存在**，
+     * 但值读不出来」（类型被外部工具改坏）。
+     *
+     * 为什么需要它：读通道要区分三件事，而 Map 只能提供「键在 / 键不在」两态：
+     *   - 键在且值合法 → 用该值；
+     *   - 键在但值损坏 → 用户表达过偏好 → 回退 [SponsorCategories.defaultModes]；
+     *   - 键根本不在（全新安装 / 老安装）→ [CategoryModes.legacyCategoryMode] 派生。
+     * 前两种在 Map 里都是 `containsKey == true`，所以损坏时放这个哨兵进去。
+     * 它是一个不可能与合法 persistedValue 相撞的字符串，[CategoryMode.fromPersisted]
+     * 会把未知值判成 fallback —— 配合哨兵即可拿到「键在」的分支。
+     *
+     * 只活在读通道的中间 Map 里（[snapshotToMap] 不写它），不污染对外键集契约。
+     */
+    private const val MODE_VALUE_CORRUPTED = "__category_mode_corrupted__"
 
     private abstract class FieldDef<T : Any>(
         val key: String,
@@ -191,11 +209,24 @@ object SettingsCodec {
     // ---------------------------------------------------------------- 四条通道
 
     fun snapshotFromPreferences(prefs: SharedPreferences): SettingsSnapshot {
+        // 只做「搬运」：把每条通道的原始值按各自读取语义摊平进 raw，任何迁移/派生
+        // 判定都不在这里 —— assemble 是唯一的解释器（见其文档）。
         val raw = HashMap<String, Any?>(FIELDS.size + 32)
         FIELDS.forEach { f -> raw[f.key] = f.readPrefs(prefs) }
         SettingsKeys.CATEGORY_MAP.keys.forEach { key -> raw[key] = prefs.getBoolean(key, true) }
         SettingsKeys.CATEGORY_COLOR_DEFAULTS.forEach { (category, def) ->
             raw[SettingsKeys.colorKey(category)] = prefs.getString(SettingsKeys.colorKey(category), def)
+        }
+        // 分类模式（prefs 通道）：这里**只负责把值搬进 raw**，不做任何迁移判定 ——
+        // 迁移语义集中在 modesFromRaw 一处（否则 prefs 与 Map 两条通道会各有一套 legacy 派生，
+        // 改一处漏一处）。键缺失时干脆不写，让 modesFromRaw 的 containsKey 自然走到
+        // legacy 分支；键存在但类型被改坏时写哨兵，保留「用户表达过偏好」这一信息。
+        SponsorCategories.ordered.forEach { category ->
+            val modeKey = SettingsKeys.categoryModeKey(category.id)
+            if (prefs.contains(modeKey)) {
+                raw[modeKey] = runCatching { prefs.getString(modeKey, null) }
+                    .getOrNull() ?: MODE_VALUE_CORRUPTED
+            }
         }
         return assemble(raw)
     }
@@ -206,8 +237,20 @@ object SettingsCodec {
     fun snapshotToMap(snapshot: SettingsSnapshot): Map<String, Any> {
         return linkedMapOf<String, Any>().apply {
             FIELDS.forEach { f -> put(f.key, f.mapValue(snapshot)) }
+            // cat_* 继续写（老安装 / 外部工具链 / 降级路径都还认它），值由四态模式派生：
+            // mode != DISABLED 即「启用」。两处不一致时以 category_mode_* 为准。
             SettingsKeys.CATEGORY_MAP.forEach { (key, category) ->
-                put(key, snapshot.enabledCategories.contains(category))
+                val mode = snapshot.categoryModes[category]
+                    ?: com.ctf.bilisb.model.SponsorCategories.defaultModes[category]
+                put(key, mode != CategoryMode.DISABLED)
+            }
+            // 分类模式：写原始 persistedValue 字符串（Map / JSON / Bundle 三条通道统一）。
+            com.ctf.bilisb.model.SponsorCategories.ordered.forEach { category ->
+                val fallback = com.ctf.bilisb.model.SponsorCategories.defaultModes.getValue(category.id)
+                put(
+                    SettingsKeys.categoryModeKey(category.id),
+                    (snapshot.categoryModes[category.id] ?: fallback).persistedValue,
+                )
             }
             SettingsKeys.CATEGORY_COLOR_DEFAULTS.forEach { (category, def) ->
                 put(SettingsKeys.colorKey(category), snapshot.categoryColors[category]?.let(::toHex) ?: def)
@@ -261,6 +304,9 @@ object SettingsCodec {
 
     /** 从原始键值组装快照（复合字段在此读取：严格类型 + 各自默认）。 */
     private fun assemble(values: Map<String, Any?>): SettingsSnapshot {
+        // 四态表要先算出来：enabledCategories 是它的派生（见 enabledFromRaw），
+        // 不能各自独立从原始键读一遍 —— 两者会因「cat_* 与 category_mode_* 谁更权威」而分叉。
+        val modes = modesFromRaw(values)
         fun <T : Any> f(def: FieldDef<T>): T = def.readMap(values)
         return SettingsSnapshot(
             enabled = f(ENABLED),
@@ -273,7 +319,7 @@ object SettingsCodec {
             cacheTtlMs = f(CACHE_TTL),
             userId = f(USER_ID),
             defaultSubmitCategory = f(DEFAULT_SUBMIT_CATEGORY),
-            enabledCategories = enabledFromRaw(values),
+            enabledCategories = enabledFromRaw(modes),
             showToast = f(SHOW_TOAST),
             showSeekbarMarker = f(SHOW_SEEKBAR_MARKER),
             showTimeDeduction = f(SHOW_TIME_DEDUCTION),
@@ -282,6 +328,7 @@ object SettingsCodec {
             categoryColors = SettingsKeys.CATEGORY_COLOR_DEFAULTS.mapValues { (category, def) ->
                 parseColor(values[SettingsKeys.colorKey(category)] as? String ?: def, def)
             },
+            categoryModes = modes,
             ipLocation = f(IP_LOCATION),
             hideTriple = f(HIDE_TRIPLE),
             hideUpPrompt = f(HIDE_UP_PROMPT),
@@ -310,11 +357,54 @@ object SettingsCodec {
         )
     }
 
-    /** 分类启用集合：cat_* 键严格布尔读取（默认 true=启用），与既有语义一致。 */
-    private fun enabledFromRaw(values: Map<String, Any?>): Set<String> =
-        SettingsKeys.CATEGORY_MAP.filter { (key, _) ->
-            (values[key] as? Boolean) ?: true
-        }.values.toSet()
+    /**
+     * 分类启用集合 = 模式 != DISABLED 的分类。
+     *
+     * 以前这里直接读 cat_* 布尔；四态之后 cat_* 只是**派生值**（由 categoryModes 写出来），
+     * 再读一次就成了「派生值的影子」：用户在设置页显式选了 intro=auto_skip，而 cat_intro 还停在
+     * 迁移前的 false，两者就会打架。因此唯一来源是 categoryModes。
+     * 代价（也是唯一的取舍）：老安装的 cat_* 在**第一次读取**时仍然生效 ——
+     * 因为 modesFromRaw 对「category_mode_* 缺失」的分类正是用 cat_* 派生的。
+     */
+    private fun enabledFromRaw(modes: Map<String, CategoryMode>): Set<String> =
+        com.ctf.bilisb.model.SponsorCategories.ordered
+            .filterTo(linkedSetOf()) { modes[it.id] != CategoryMode.DISABLED }
+            .mapTo(linkedSetOf()) { it.id }
+
+    /**
+     * 分类四态表：**读通道唯一的迁移解释器**（prefs / Map / JSON / Bundle 全走这里）。
+     *
+     * 逐分类三分支，顺序即语义：
+     *   1. 键在、值合法 → 直接用该值（用户的显式选择永远最优先）；
+     *   2. 键在、值非法/损坏（外部改写、跨版本新增枚举、prefs 类型被改坏后落下的
+     *      [MODE_VALUE_CORRUPTED]）→ 用户表达过偏好但表达坏了 → 退回
+     *      [com.ctf.bilisb.model.SponsorCategories.defaultModes] 里该分类的默认模式；
+     *   3. 键缺失（全新安装 / 老安装升级，从没写过 `category_mode_*`）→
+     *      [CategoryModes.legacyCategoryMode] 按 `cat_*` + 两个全局开关派生，
+     *      保证升级后行为与四态化之前一致。
+     *
+     * 第 2 与第 3 分支的区分靠 `containsKey`，因此 prefs 通道在「键在但读不出值」时
+     * 必须写哨兵而不是留 null —— null 与「键不存在」在 Map 里无法区分。
+     */
+    private fun modesFromRaw(values: Map<String, Any?>): Map<String, CategoryMode> {
+        val autoSkip = AUTO_SKIP.readMap(values)
+        val manualSkip = MANUAL_SKIP.readMap(values)
+        val defaults = SponsorCategories.defaultModes
+        return SponsorCategories.ordered.associate { category ->
+            val modeKey = SettingsKeys.categoryModeKey(category.id)
+            val fallback = if (values.containsKey(modeKey)) {
+                // 键在：偏好存在（哪怕值坏了），不再做 legacy 派生。
+                defaults.getValue(category.id)
+            } else {
+                CategoryModes.legacyCategoryMode(
+                    enabled = (values[category.settingsKey] as? Boolean) ?: true,
+                    autoSkip = autoSkip,
+                    manualSkip = manualSkip,
+                )
+            }
+            category.id to CategoryMode.fromPersisted(values[modeKey] as? String, fallback)
+        }
+    }
 
     // ---------------------------------------------------------------- 解析辅助（历史语义不变）
 

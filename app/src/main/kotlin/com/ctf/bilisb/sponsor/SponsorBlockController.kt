@@ -19,6 +19,8 @@ import com.ctf.bilisb.util.info
 import android.content.Context
 import io.github.libxposed.api.XposedModule
 import java.util.Locale
+import com.ctf.bilisb.model.CategoryMode
+import com.ctf.bilisb.settings.CategoryModes
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -38,7 +40,7 @@ class SponsorBlockController(
                 serverAddress = settings.serverAddress,
                 enabled = settings.enabled,
                 autoSkip = settings.autoSkip,
-                enabledCategories = settings.enabledCategories,
+                enabledCategories = CategoryModes.enabledCategories(settings),
             )
         ),
         cacheTtlMs = settings.cacheTtlMs,
@@ -484,8 +486,13 @@ class SponsorBlockController(
             durationMs = decisionDurationMs,
         )
 
-        // 手动跳过优先:命中片段时浮出按钮,由用户点按跳过;离开片段时收起。
-        if (settings.manualSkip) {
+        // 分流由**分类的生效模式**决定（categoryModes 经全局 auto_skip / manual_skip 降级），
+        // 不再是「全局 manualSkip 优先、否则 autoSkip」的两分支。
+        val mode = segment?.let { CategoryModes.effectiveMode(settings, it.category) }
+            ?: CategoryMode.SHOW_OVERLAY
+
+        // 手动跳过:命中 MANUAL_SKIP 分类的片段时浮出按钮,由用户点按跳过;离开片段时收起。
+        if (mode == CategoryMode.MANUAL_SKIP) {
             if (segment == null) {
                 if (manualButtonSegmentKeyByContext.remove(contextHash) != null) {
                     ManualSkipButton.hide(module, handle.container)
@@ -522,8 +529,19 @@ class SponsorBlockController(
             return
         }
 
-        // 以下为自动跳过(立即 / 倒计时)。autoSkip 关闭则只剩静音生效,直接返回。
-        if (!settings.autoSkip) {
+        // 只有 AUTO_SKIP 分类才走自动跳过(立即 / 倒计时)。
+        // SHOW_OVERLAY / DISABLED 的片段在这里**必须把残留 UI 清干净**：从
+        // MANUAL_SKIP 分类切进 SHOW_OVERLAY 分类(或用户中途改设置)时，
+        // 按钮 / 倒计时浮层会滞留在屏幕上不消失 —— 进度条标记由别处绘制，不受影响。
+        if (mode != CategoryMode.AUTO_SKIP) {
+            if (manualButtonSegmentKeyByContext.remove(contextHash) != null) {
+                ManualSkipButton.hide(module, handle.container)
+            }
+            // SHOW_OVERLAY 分类不该有倒计时在跑（多半是设置刚改成只标记）；
+            // 这里不做 skipped 回删 —— 用户没点「取消」，标记按语义保留。
+            if (countdownSegmentKeyByContext.remove(contextHash) != null) {
+                SkipCountdownOverlay.cancel(module, handle.container)
+            }
             return
         }
 

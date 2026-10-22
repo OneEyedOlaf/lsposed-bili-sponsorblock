@@ -291,4 +291,59 @@ class SponsorBlockClientTest {
         videoDurationMs = videoDurationMs,
         epId = epId,
     )
+
+    // ------------------------------------------------------------------ 投票
+
+    @Test
+    fun voteRejectsInvalidTypeWithoutSendingRequest() {
+        // type 只允许 0/1。非法值必须在**发请求之前**被拒 —— 服务端可能把未知
+        // type 当赞成处理,那等于替用户乱投票。
+        val result = client.voteOnSegment("uuid-1", "user-1", 2)
+        assertEquals(-1, result.statusCode)
+        assertEquals(0, result.localDeltaVote)
+        assertFalse(result.isSuccess)
+    }
+
+    @Test
+    fun voteRejectsBlankSegmentUuid() {
+        val result = client.voteOnSegment("   ", "user-1", 1)
+        assertEquals(-1, result.statusCode)
+        assertFalse(result.isSuccess)
+    }
+
+    @Test
+    fun voteLocalDeltaFollowsType() {
+        // 服务端不回新票数,本地按 type 推算供 UI 立即反馈:+1 / −1。
+        // 直接测纯函数 localVoteDelta —— 早先这条用例靠 voteOnSegment("", …) 拿结果,
+        // 但空 UUID 在入参校验处就 return 了,localDeltaVote 恒为 0,断言 0 == 0 毫无意义。
+        assertEquals(1, client.localVoteDelta(1))
+        assertEquals(-1, client.localVoteDelta(0))
+        // 非法 type 不会发出请求,因此不能谎报有票数变化。
+        assertEquals(0, client.localVoteDelta(2))
+        assertEquals(0, client.localVoteDelta(-1))
+    }
+
+    @Test
+    fun voteResultIsSuccessOnlyOn2xx() {
+        val ok = SponsorBlockClient.VoteResult(204, null)
+        val bad = SponsorBlockClient.VoteResult(500, null)
+        assertTrue(ok.isSuccess)
+        assertFalse(bad.isSuccess)
+    }
+
+    // ------------------------------------------------------------ 贡献统计
+
+    @Test
+    fun userStatsRejectsBlankUserIdWithoutSendingRequest() {
+        val result = client.fetchUserContributionStats("   ")
+        assertTrue(result is SponsorBlockClient.UserStatsResult.Failure)
+        assertEquals("empty user id", (result as SponsorBlockClient.UserStatsResult.Failure).message)
+    }
+
+    @Test
+    fun userStatsSuccessCarriesBothNumbers() {
+        val stats = SponsorBlockClient.UserContributionStats(viewCount = 12, minutesSaved = 34.5)
+        assertEquals(12L, stats.viewCount)
+        assertEquals(34.5, stats.minutesSaved, 0.0001)
+    }
 }

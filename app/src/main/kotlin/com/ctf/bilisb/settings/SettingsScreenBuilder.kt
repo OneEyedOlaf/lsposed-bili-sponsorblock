@@ -27,6 +27,7 @@ import android.widget.TextView
 import android.widget.Toast
 import com.ctf.bilisb.BuildConfig
 import com.ctf.bilisb.R
+import com.ctf.bilisb.model.CategoryMode
 import com.ctf.bilisb.model.SponsorCategories
 import com.ctf.bilisb.sponsor.SkipStatsStore
 import com.ctf.bilisb.sponsor.UserIdentityStore
@@ -36,6 +37,9 @@ import com.ctf.bilisb.unlock.UposSpeedTester
 
 object SettingsScreenBuilder {
     private const val REPO_URL = "https://github.com/ch6vip/lsposed-bili-sponsorblock"
+
+    /** 分类模式行里「当前模式」那个 TextView 的 tag（刷新时按 child index 取,tag 留给测试定位）。 */
+    private const val MODE_VALUE_TAG = "category_mode_value"
 
     /**
      * 取资源文案。
@@ -793,6 +797,89 @@ object SettingsScreenBuilder {
         }
     }
 
+    /**
+     * 分类四态选择行:标题 + 当前模式文案 + 一行说明,点击弹出单选对话框。
+     *
+     * 与 [unlockAreaRow] 同构(TextView 行 + AlertDialog),区别是竖排三段文字。
+     * 落盘写两处:category_mode_* 是权威值,cat_* 同步成 (mode != DISABLED) ——
+     * 老安装 / 外部工具链继续读 cat_* 不会因为换了控件就看到过期状态。
+     */
+    private fun categoryModeRow(
+        activity: Activity,
+        prefs: SharedPreferences,
+        category: SponsorCategories.Category,
+        title: String,
+        summary: String,
+    ): View {
+        val modeKey = SettingsKeys.categoryModeKey(category.id)
+        val modes = listOf(
+            CategoryMode.SHOW_OVERLAY,
+            CategoryMode.MANUAL_SKIP,
+            CategoryMode.AUTO_SKIP,
+            CategoryMode.DISABLED,
+        )
+        val labels = modes.map { str(activity, categoryModeLabelRes(it)) }
+        fun selected(): CategoryMode = CategoryMode.fromPersisted(
+            prefs.getString(modeKey, null),
+            SponsorCategories.defaultModes[category.id] ?: CategoryMode.SHOW_OVERLAY,
+        )
+        val row = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(activity, 8), 0, dp(activity, 8))
+            isClickable = true
+            isFocusable = true
+            background = selectableItemBackground(activity)
+            addView(TextView(activity).apply {
+                text = title
+                textSize = 15f
+                setTextColor(primaryTextColor(activity))
+            })
+            addView(TextView(activity).apply { tag = MODE_VALUE_TAG })
+            addView(TextView(activity).apply {
+                text = summary
+                textSize = 12f
+                setTextColor(BILI_TEXT_SECONDARY)
+            })
+        }
+        fun refresh() {
+            (row.getChildAt(1) as TextView).text = str(
+                activity, categoryModeValueLabelRes(selected()),
+            )
+        }
+        refresh()
+        row.setOnClickListener {
+            AlertDialog.Builder(activity)
+                .setTitle(title)
+                .setSingleChoiceItems(labels.toTypedArray(), modes.indexOf(selected())) { dialog, which ->
+                    prefs.edit()
+                        .putString(modeKey, modes[which].persistedValue)
+                        .putBoolean(category.settingsKey, modes[which] != CategoryMode.DISABLED)
+                        .apply()
+                    refresh()
+                    dialog.dismiss()
+                }
+                .setNegativeButton(str(activity, R.string.common_cancel), null)
+                .show()
+        }
+        return row
+    }
+
+    /** 四态在对话框里的选项名。 */
+    private fun categoryModeLabelRes(mode: CategoryMode): Int = when (mode) {
+        CategoryMode.DISABLED -> R.string.category_mode_disabled
+        CategoryMode.SHOW_OVERLAY -> R.string.category_mode_show_overlay
+        CategoryMode.MANUAL_SKIP -> R.string.category_mode_manual_skip
+        CategoryMode.AUTO_SKIP -> R.string.category_mode_auto_skip
+    }
+
+    /** 四态在行内的当前值文案(带分类名,读起来是「赞助/恰饭 · 自动跳过」)。 */
+    private fun categoryModeValueLabelRes(mode: CategoryMode): Int = when (mode) {
+        CategoryMode.DISABLED -> R.string.category_mode_value_disabled
+        CategoryMode.SHOW_OVERLAY -> R.string.category_mode_value_show_overlay
+        CategoryMode.MANUAL_SKIP -> R.string.category_mode_value_manual_skip
+        CategoryMode.AUTO_SKIP -> R.string.category_mode_value_auto_skip
+    }
+
     private fun statusPanel(activity: Activity, statusWriter: SettingsWriter? = null): View {
         val writer = statusWriter ?: synchronized(this) {
             sharedStatusWriter ?: SettingsWriter(activity.applicationContext).also { sharedStatusWriter = it }
@@ -866,14 +953,19 @@ object SettingsScreenBuilder {
             }
 
             biliSection(this, activity, str(activity, R.string.section_categories)) {
-                // 顺序、设置键、显示名全部来自 SponsorCategories（单一事实来源）；
+                // 顺序 / 显示名 / 默认模式全部来自 SponsorCategories（单一事实来源）；
                 // 这里只保留「一句话说明」这类纯 UI 文案（同样走资源）。
-                val categories = SponsorCategories.ordered.map { category ->
-                    Triple(category.settingsKey, SponsorCategories.displayName(activity, category.id), categoryHint(activity, category.id))
-                }
-                categories.forEachIndexed { index, (key, title, summary) ->
+                // 四态选择（关闭 / 只标记 / 手动跳过 / 自动跳过）。视觉沿用同文件既有的
+                // 「TextView 行 + 单选 AlertDialog」形态（见 unlockAreaRow），不引入 XML 布局。
+                SponsorCategories.ordered.forEachIndexed { index, category ->
                     if (index > 0) addView(biliDividerInner(activity))
-                    addView(createCheckBox(activity, prefs, key, title, summary, true))
+                    addView(
+                        categoryModeRow(
+                            activity, prefs, category,
+                            SponsorCategories.displayName(activity, category.id),
+                            categoryHint(activity, category.id),
+                        ),
+                    )
                 }
             }
 
@@ -1383,6 +1475,7 @@ object SettingsScreenBuilder {
         "preview" -> str(activity, R.string.category_hint_preview)
         "music_offtopic" -> str(activity, R.string.category_hint_music_offtopic)
         "filler" -> str(activity, R.string.category_hint_filler)
+        "padding" -> str(activity, R.string.category_hint_padding)
         com.ctf.bilisb.model.SponsorCategories.POI_HIGHLIGHT -> str(activity, R.string.category_hint_poi_highlight)
         else -> SponsorCategories.displayName(activity, category)
     }
